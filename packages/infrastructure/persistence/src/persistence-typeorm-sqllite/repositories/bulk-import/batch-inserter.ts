@@ -3,42 +3,62 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+import type {EntityBaseRow} from 'persistence-typeorm-sqllite/entity-schema/entity-base.js';
 import {EntityManager, type EntityTarget, type ObjectLiteral} from 'typeorm';
-import type {QueryDeepPartialEntity} from 'typeorm/query-builder/QueryPartialEntity.js';
 
-export interface BatchInsertResult<TRow> {
-  succeeded: TRow[];
-  failed: Array<{row: TRow; error: Error}>;
+export interface BatchInsertError {
+  /** System ID of the failing entity */
+  systemId: number;
+
+  message: string;
+}
+
+export interface BatchInsertResult {
+  success: boolean;
+  failedEntities: BatchInsertError[];
 }
 
 export const BatchInserter = {
-  async insert<TEntity extends ObjectLiteral>(
+  async insert<TEntity extends EntityBaseRow & ObjectLiteral>(
     manager: EntityManager,
     target: EntityTarget<TEntity>,
-    rows: QueryDeepPartialEntity<TEntity>[],
+    rows: TEntity[],
     batchSize = 100,
-  ): Promise<BatchInsertResult<QueryDeepPartialEntity<TEntity>>> {
-    const succeeded: QueryDeepPartialEntity<TEntity>[] = [];
-    const failed: Array<{row: QueryDeepPartialEntity<TEntity>; error: Error}> =
-      [];
+  ): Promise<BatchInsertResult> {
+    if (batchSize <= 0) {
+      throw new Error('batchSize must be > 0');
+    }
+
+    const result: BatchInsertResult = {
+      success: true,
+      failedEntities: [],
+    };
 
     for (let i = 0; i < rows.length; i += batchSize) {
       const batch = rows.slice(i, i + batchSize);
+
       try {
         await manager.insert<TEntity>(target, batch);
-        succeeded.push(...batch);
-      } catch {
+      } catch (_batchError: unknown) {
+        // fallback to isolate failing rows
         for (const row of batch) {
           try {
             await manager.insert<TEntity>(target, row);
-            succeeded.push(row);
-          } catch (rowError) {
-            failed.push({row, error: rowError as Error});
+          } catch (rowError: unknown) {
+            const message =
+              rowError instanceof Error ? rowError.message : String(rowError);
+
+            result.failedEntities.push({
+              systemId: row.systemId,
+              message,
+            });
+
+            result.success = false;
           }
         }
       }
     }
 
-    return {succeeded, failed};
+    return result;
   },
 };
