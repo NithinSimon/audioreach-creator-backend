@@ -139,9 +139,9 @@ When the user adds a link between modules in different subsystems, the server cr
 
 Note: `actualLinkSystemId = L1` is set immediately because the actual link's ID is pre-assigned before the segments are created.
 
-### 2.3 VirtualLinkSegment CREATE (subsystem mode — user draws a segment)
+### 2.3 VirtualLinkSegment CREATE (user draws a segment with a subsystem endpoint)
 
-When the user draws a segment in subsystem mode, only a `VirtualLinkSegment` CREATE is recorded. No actual link yet.
+When the user calls `POST /data-links` with at least one subsystem node as an endpoint, the server creates a `VirtualLinkSegment` CREATE. No actual link yet.
 
 | Column | Value |
 |--------|-------|
@@ -209,9 +209,9 @@ When the user deletes an actual link in flat mode, the server records a DELETE f
 | `base_version` | Current `version` of the segment in `virtual_link_segments` |
 | `group_id` | Same shared UUID `G2` |
 
-### 2.6 VirtualLinkSegment DELETE (subsystem mode — user deletes a segment)
+### 2.6 VirtualLinkSegment DELETE (user deletes a virtual segment via `DELETE /data-links/{id}`)
 
-When the user deletes a virtual segment in subsystem mode, only the segment DELETE is recorded. No cascade at this point.
+When the user calls `DELETE /data-links/{id}` and the server determines `id` refers to a virtual segment, only the segment DELETE is recorded. No cascade at this point.
 
 | Column | Value |
 |--------|-------|
@@ -294,7 +294,7 @@ edit_actions: (C1–C4 deleted after commit)
 
 ### 3.4 After: User adds segments in subsystem mode (step by step)
 
-User calls `POST /virtual-links` three times.
+User calls `POST /data-links` three times with subsystem endpoints.
 
 ```
 data_links:            (unchanged — L1 still present from previous commit)
@@ -371,7 +371,7 @@ edit_actions: (C9–C12 deleted after commit)
 
 ### 3.9 After: User deletes segment S5 in subsystem mode
 
-User calls `DELETE /virtual-links/S5`.
+User calls `DELETE /data-links/S5`.
 
 ```
 data_links:            (unchanged — L2 still present)
@@ -620,7 +620,7 @@ However, the `VirtualLinkSegment` DELETE operations are still recorded in `edit_
 
 ## 8) One-Connection-Per-Port Enforcement
 
-### 8.1 At `POST /virtual-links` time
+### 8.1 At `POST /data-links` time (when server determines it is creating a virtual segment)
 
 Before inserting a new virtual segment, the server checks:
 
@@ -665,5 +665,3 @@ No additional lookup is needed.
 The constraint prevents a port from being the source of two different segments or the destination of two different segments. It does not prevent a port from appearing as both source and destination in different segments of the same chain (which is the normal case for transit segments like S2).
 
 ---
-
-*End of Document*

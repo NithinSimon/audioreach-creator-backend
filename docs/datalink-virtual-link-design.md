@@ -138,7 +138,7 @@ No `chain_id` column is added to `data_links`. The grouping between actual links
 
 A subsystem port (a `data_ports` row whose `node_system_id` references a subsystem node) may have at most one incoming virtual link segment and at most one outgoing virtual link segment within a given file.
 
-This is enforced at `POST /virtual-links` time by checking the `virtual_link_segments` table (including the `edit_actions` overlay for the active session) before inserting. If the source port already has an outgoing segment or the destination port already has an incoming segment, the request is rejected with `422`.
+This is enforced at `POST /data-links` time (when the server determines it is creating a virtual segment) by checking the `virtual_link_segments` table (including the `edit_actions` overlay for the active session) before inserting. If the source port already has an outgoing segment or the destination port already has an incoming segment, the request is rejected with `422`.
 
 **Why this matters:** if a subsystem port were shared between two chains, deleting a segment that uses that port would break both chains and delete two actual links. The one-connection constraint ensures each segment belongs to exactly one chain, so deleting a segment always affects exactly one actual link.
 
@@ -157,7 +157,7 @@ If a virtual chain is incomplete at commit time (no complete module-to-module pa
 
 ### Invariant 4: `actual_link_system_id` is null until resolution (subsystem-mode segments only)
 
-Virtual link segments created in subsystem mode (via `POST /virtual-links`) have `actual_link_system_id = null` in `edit_actions` until the chain is resolved at `GET /components?showSubsystems=false` or at commit time.
+Virtual link segments created when a subsystem endpoint is involved (via `POST /data-links` with a subsystem node as source or destination) have `actual_link_system_id = null` in `edit_actions` until the chain is resolved at `GET /components?showSubsystems=false` or at commit time.
 
 Virtual link segments auto-created by the server when a flat-mode link is added (Workflow B) are an exception: because the actual link's `system_id` is pre-assigned before the segments are created, `actual_link_system_id` is set immediately on those segments. They are never in an unresolved state.
 
@@ -165,41 +165,55 @@ Virtual link segments auto-created by the server when a flat-mode link is added 
 
 ## 5) API Design
 
-### Existing endpoints (unchanged behaviour)
+### Unified connection endpoint
 
 **`POST /arc-api/v1/projects/{projectId}/data-links`**
-Creates an actual link in flat mode. Behaviour is extended: after creating the `DataLink` `edit_actions` row, the server checks `nodes.parentId` for both endpoints. If they belong to different subsystems, the server automatically creates `VirtualLinkSegment` `edit_actions` rows for the crossing segments. The actual link's pre-assigned `system_id` is written into `actual_link_system_id` on these auto-created segments immediately (since the ID is known at creation time).
 
-**`DELETE /arc-api/v1/projects/{projectId}/data-links/{systemId}`**
-Deletes an actual link. Extended behaviour: the server also records `VirtualLinkSegment` DELETE operations in `edit_actions` for all segments in `virtual_link_segments` where `actual_link_system_id = systemId`. Both the actual link DELETE and the segment DELETEs are grouped under the same `group_id` in `edit_actions`.
+Creates a connection between two nodes. The server determines whether to create an actual link or a virtual link segment based on the node types of the endpoints. No mode state is required.
 
-### New endpoints
-
-**`POST /arc-api/v1/projects/{projectId}/virtual-links`**
-
-Adds a virtual link segment. Request body:
+Request body:
 - `sourceNodeSystemId` — node ID (module or subsystem)
 - `destinationNodeSystemId` — node ID (module or subsystem)
 - `sourcePortSystemId` — port ID
 - `destinationPortSystemId` — port ID
 
+**Server routing logic (based on node types):**
+
+| Source node type | Dest node type | Server action |
+|---|---|---|
+| Module | Module (same subsystem or no subsystem) | Create `DataLink` in `edit_actions` only |
+| Module | Module (different subsystems) | Create `DataLink` + auto-create `VirtualLinkSegment` rows in `edit_actions`; `actual_link_system_id` set immediately |
+| Module | Subsystem | Create `VirtualLinkSegment` in `edit_actions`; `actual_link_system_id = null` |
+| Subsystem | Subsystem | Create `VirtualLinkSegment` in `edit_actions`; `actual_link_system_id = null` |
+| Subsystem | Module | Create `VirtualLinkSegment` in `edit_actions`; `actual_link_system_id = null` |
+
+For virtual segment creation (any row with a subsystem endpoint), the server validates the one-connection-per-port constraint (see Invariant 1) before inserting. Returns `422` if violated.
+
+**Response:**
+```json
+{ "systemId": 123, "type": "DataLink" }
+```
+or
+```json
+{ "systemId": 456, "type": "VirtualLinkSegment" }
+```
+
+The `type` field tells the client whether it received an actual link ID or a virtual segment ID, so it can render and manage the connection correctly.
+
+---
+
+**`DELETE /arc-api/v1/projects/{projectId}/data-links/{systemId}`**
+
+Deletes a connection. The `systemId` may refer to an actual link in `data_links`, a virtual segment in `virtual_link_segments`, or a pending entry in `edit_actions`.
+
 Server behaviour:
-1. Validates the one-connection-per-port constraint (see Invariant 1). Returns `422` if violated.
-2. Pre-assigns a `system_id` via `IdGenerationPort`.
-3. Creates a `VirtualLinkSegment` CREATE operation in `edit_actions` with `actual_link_system_id = null`.
-4. Returns the new segment's `system_id`.
-
-No chain detection is performed at this point. The server simply stores the segment.
-
-**`DELETE /arc-api/v1/projects/{projectId}/virtual-links/{systemId}`**
-
-Deletes a virtual link segment. The `systemId` may refer to:
-- A segment in `virtual_link_segments` (committed in a previous session), or
-- A segment in `edit_actions` (added in the current session, not yet committed).
-
-Server behaviour:
-1. Records a `VirtualLinkSegment` DELETE operation in `edit_actions`.
-2. Does **not** immediately cascade to the actual link. Chain breakage is detected at resolution time (commit or `GET /components?showSubsystems=false`).
+1. **If `systemId` is an actual link** (`data_links` or pending `DataLink` CREATE in `edit_actions`):
+   - Records a `DataLink` DELETE in `edit_actions`
+   - Also records `VirtualLinkSegment` DELETE operations for all segments where `actual_link_system_id = systemId`
+   - All DELETEs share the same `group_id`
+2. **If `systemId` is a virtual segment** (`virtual_link_segments` or pending `VirtualLinkSegment` CREATE in `edit_actions`):
+   - Records a `VirtualLinkSegment` DELETE in `edit_actions`
+   - Does **not** immediately cascade to the actual link — chain breakage is detected at resolution time
 
 ### Modified endpoint
 
@@ -256,9 +270,9 @@ The user creates a link between ModuleA (inside SubsystemX) and ModuleB (inside 
 
 The user is in subsystem mode and draws a connection from ModuleA (inside SubsystemX) to ModuleB (inside SubsystemY) by drawing three segments.
 
-1. Client calls `POST /virtual-links` for segment `ModuleA → SubsystemX`. Server stores S1 in `edit_actions` with `actual_link_system_id = null`. Returns `system_id = S1`.
-2. Client calls `POST /virtual-links` for segment `SubsystemX → SubsystemY`. Server stores S2 in `edit_actions` with `actual_link_system_id = null`. Returns `system_id = S2`.
-3. Client calls `POST /virtual-links` for segment `SubsystemY → ModuleB`. Server stores S3 in `edit_actions` with `actual_link_system_id = null`. Returns `system_id = S3`.
+1. Client calls `POST /data-links { sourceNode: ModuleA, destNode: SubsystemX, ... }`. Server detects subsystem endpoint → creates VirtualLinkSegment S1 in `edit_actions` with `actual_link_system_id = null`. Returns `{ systemId: S1, type: "VirtualLinkSegment" }`.
+2. Client calls `POST /data-links { sourceNode: SubsystemX, destNode: SubsystemY, ... }`. Server creates VirtualLinkSegment S2 in `edit_actions`. Returns `{ systemId: S2, type: "VirtualLinkSegment" }`.
+3. Client calls `POST /data-links { sourceNode: SubsystemY, destNode: ModuleB, ... }`. Server creates VirtualLinkSegment S3 in `edit_actions`. Returns `{ systemId: S3, type: "VirtualLinkSegment" }`.
 4. No actual link exists yet. The chain is complete but unresolved.
 5. When the user calls `GET /components?showSubsystems=false` (or at commit), the server detects the complete chain S1→S2→S3, creates actual link `L1` in `edit_actions` (STAGED), and sets `actual_link_system_id = L1` on S1, S2, S3.
 
@@ -266,7 +280,7 @@ The user is in subsystem mode and draws a connection from ModuleA (inside Subsys
 
 ModuleA is inside SubsystemX, which is itself inside SubsystemZ. ModuleB is inside SubsystemY.
 
-The user draws four segments:
+The user calls `POST /data-links` four times with subsystem endpoints:
 - `ModuleA → SubsystemX`
 - `SubsystemX → SubsystemZ`
 - `SubsystemZ → SubsystemY`
@@ -289,7 +303,7 @@ The user deletes actual link `L1` (ModuleA → ModuleB), which has virtual segme
 
 The user deletes segment S2 (`SubsystemX → SubsystemY`), which is in `virtual_link_segments` with `actual_link_system_id = L1`.
 
-1. Client calls `DELETE /virtual-links/S2`.
+1. Client calls `DELETE /data-links/S2`.
 2. Server records a `VirtualLinkSegment` DELETE operation in `edit_actions` for S2.
 3. No immediate cascade. The actual link `L1` is not touched yet.
 4. At resolution time (next `GET /components?showSubsystems=false` or commit): the server re-traverses the virtual segment graph. The chain is now broken (S1 ends at SubsystemX, but S2 is deleted, so there is no path from SubsystemX to SubsystemY). The server records a `DataLink` DELETE operation in `edit_actions` for `L1`. The server also records `VirtualLinkSegment` DELETE operations in `edit_actions` for S1 and S3 (they are now orphaned — part of a broken chain with no corresponding actual link). All three DELETE operations share the same `group_id`.
@@ -299,7 +313,7 @@ The user deletes segment S2 (`SubsystemX → SubsystemY`), which is in `virtual_
 
 The user added segment S2 in the current session (it is in `edit_actions` as a CREATE, not yet in `virtual_link_segments`). The user then deletes it.
 
-1. Client calls `DELETE /virtual-links/S2`.
+1. Client calls `DELETE /data-links/S2`.
 2. Server supersedes the CREATE operation for S2 in `edit_actions` (sets `valid_until` on the CREATE row, per the modification framework's versioning pattern).
 3. S2 is effectively removed from the pending state.
 4. At resolution time: the chain is incomplete (S1 and S3 exist but S2 is gone). No actual link is created. S1 and S3 are discarded.
@@ -311,7 +325,7 @@ The user has drawn only segment S1 (`ModuleA → SubsystemX`) and tries to switc
 1. Server runs the slow path: traverses the virtual segment graph.
 2. S1 is a dead end — SubsystemX has no outgoing segment. The chain is incomplete.
 3. Server returns `422` with the incomplete chain details: "Incomplete virtual link starting at ModuleA (port P1). Please complete or delete this connection before switching to flat mode."
-4. The user deletes S1 via `DELETE /virtual-links/S1`.
+4. The user deletes S1 via `DELETE /data-links/S1`.
 5. The user calls `GET /components?showSubsystems=false` again.
 6. No incomplete chains remain. The server returns the flat-mode view successfully.
 
@@ -404,7 +418,7 @@ Users are locked at the usecase level — two users cannot edit the same usecase
 **Decision:** Virtual link segments are the source of truth during editing. Actual links are derived from complete chains at resolution time (`GET /components?showSubsystems=false` or commit). Actual links are never staged independently for subsystem-mode connections.
 
 **Alternatives considered:**
-- Stage actual links immediately when chain is complete (detect completion on every `POST /virtual-links`): adds O(n) graph traversal on every add call; creates a tight coupling between add and chain detection.
+- Stage actual links immediately when chain is complete (detect completion on every `POST /data-links` call with a subsystem endpoint): adds O(n) graph traversal on every add call; creates a tight coupling between add and chain detection.
 - Client-owned virtual links (client translates to actual links before calling API): pushes all chain management to the client; client must buffer partial chains across interactions; error-prone.
 
 **Rationale:** Deferring resolution to a well-defined point (flat-mode read or commit) keeps the server simple during editing and avoids premature chain detection. The client has full data and can show the user the partial chain state without server involvement.
@@ -433,7 +447,7 @@ Users are locked at the usecase level — two users cannot edit the same usecase
 
 **Context:** If a subsystem port is shared between two chains, deleting a segment that uses that port would break both chains and delete two actual links unexpectedly.
 
-**Decision:** A subsystem port may have at most one incoming and one outgoing virtual link segment within a file. This is enforced at `POST /virtual-links` time.
+**Decision:** A subsystem port may have at most one incoming and one outgoing virtual link segment within a file. This is enforced at `POST /data-links` time when the server determines it is creating a virtual segment.
 
 **Rationale:** This constraint is also semantically correct for audio signal processing — a physical port carries one signal. Enforcing it at the API level prevents ambiguous chain membership and ensures that deleting a segment always affects exactly one actual link.
 
@@ -518,10 +532,10 @@ Virtual link segments integrate with the existing modification framework as foll
 |----------|--------------|---------------|-----------------|
 | Add link, flat mode, same subsystem | `POST /data-links` | Create DataLink in `edit_actions`; no virtual segments | Commit |
 | Add link, flat mode, different subsystems | `POST /data-links` | Create DataLink + VirtualLinkSegments in `edit_actions`; `actual_link_system_id` set immediately | Commit |
-| Add segment, subsystem mode | `POST /virtual-links` | Create VirtualLinkSegment in `edit_actions`; `actual_link_system_id = null` | Deferred |
+| Add segment, subsystem mode | `POST /data-links` (subsystem endpoint) | Create VirtualLinkSegment in `edit_actions`; `actual_link_system_id = null` | Deferred |
 | Delete link, flat mode | `DELETE /data-links/{id}` | Delete DataLink + all VirtualLinkSegments for that link in `edit_actions` | Commit |
-| Delete segment, subsystem mode (committed) | `DELETE /virtual-links/{id}` | Delete VirtualLinkSegment in `edit_actions`; no immediate cascade | Resolution time |
-| Delete segment, subsystem mode (pending) | `DELETE /virtual-links/{id}` | Supersede the CREATE in `edit_actions` | N/A |
+| Delete segment, subsystem mode (committed) | `DELETE /data-links/{id}` | Delete VirtualLinkSegment in `edit_actions`; no immediate cascade | Resolution time |
+| Delete segment, subsystem mode (pending) | `DELETE /data-links/{id}` | Supersede the CREATE in `edit_actions` | N/A |
 | Switch to flat mode, complete chain | `GET /components?showSubsystems=false` | Resolve chains; create DataLink in `edit_actions` (STAGED); set `actual_link_system_id` | Immediate (slow path) |
 | Switch to flat mode, incomplete chain | `GET /components?showSubsystems=false` | Return `422` with incomplete chain details | Blocked |
 | Read in subsystem mode | `GET /components?showSubsystems=true` | Return VirtualLinkSegments with overlay; no resolution | N/A |
