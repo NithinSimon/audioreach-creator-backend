@@ -453,6 +453,35 @@ Users are locked at the usecase level — two users cannot edit the same usecase
 
 ---
 
+### ADR-VL-006: Server-stored virtual links over client-owned virtual links
+
+**Context:** Two approaches were evaluated for managing virtual link segments:
+- **Option A (Server-stored):** `virtual_link_segments` is a permanent server-side table. The server owns both actual links and virtual segments. Chain resolution, cascade deletes, and invariant enforcement happen on the server.
+- **Option B (Client-owned):** Only actual links are stored on the server. The client derives virtual links from actual links + node hierarchy at read time, and translates all virtual operations to actual link operations before calling the API.
+
+**Decision:** Option A — server-stored virtual links.
+
+**Alternatives considered:**
+- Option B (client-owned): simpler server, no new table, clean domain model. Rejected because it distributes business logic across all clients, cannot enforce invariants server-side, and does not scale to multiple client types.
+
+**Trade-offs and risks:**
+
+| Criterion | Option A (Server) | Option B (Client) |
+|---|---|---|
+| Data integrity | Server enforces invariants | Client must enforce; no guarantee |
+| Multi-client support | Any client works correctly | Every client must re-implement logic |
+| Future evolution | Scales naturally | Complexity multiplies with clients |
+| Audit trail | Full user intent captured in `edit_actions` | Only derived result captured |
+| Debuggability | Server-side validation errors | Silent client-side bugs |
+| Complexity | Bounded, centralised | Unbounded, distributed |
+| Domain purity | UX metadata in DB (justified) | Clean domain |
+
+**Rationale:** In a client-server system, the server is the authoritative source of truth for all data. Splitting the data model across tiers — server owns actual links, client owns virtual links — violates this principle and creates a maintenance burden that compounds with every new client. The `virtual_link_segments` table is not arbitrary UX state; it represents the user's explicit intent about connection topology across subsystem boundaries, has a clear lifecycle, and is directly linked to actual links via FK. The one-time complexity cost of server-side chain resolution is outweighed by the correctness, maintainability, and multi-client benefits.
+
+**Status:** Accepted
+
+---
+
 ## 9) Integration with Modification Framework
 
 Virtual link segments integrate with the existing modification framework as follows:
