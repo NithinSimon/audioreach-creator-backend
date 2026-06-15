@@ -8,15 +8,17 @@ import type {EntityBaseRow} from '../../entity-base.js';
 import type {ArcDbFileRow} from '../../project-data/arc-db-file.schema.js';
 import type {SpfModuleRow} from '../module/spf-module.schema.js';
 import type {ContainerPropertyDataRow} from './container-property-data.js';
+import type {ContainerTypeRow} from '../../definitions/container/container-definition.schema.js';
 import {EntitySchema} from 'typeorm';
 
 export interface ContainerRow extends EntityBaseRow {
-  type: string;
   containerId: number;
+  containerTypeSystemId: number;
 
   // inverse relation for convenience (reads)
   modules?: SpfModuleRow[];
   containerPropertyData?: ContainerPropertyDataRow[];
+  containerType?: ContainerTypeRow;
   // scope to file
   fileSystemId: number;
   file?: ArcDbFileRow;
@@ -27,8 +29,12 @@ export const ContainerSchema = new EntitySchema<ContainerRow>({
   tableName: 'containers',
   columns: {
     ...BaseColumnSchemaPart,
-    type: {name: 'type', type: 'varchar', length: 128},
     containerId: {name: 'container_id', type: 'integer'},
+    containerTypeSystemId: {
+      name: 'container_type_system_id',
+      type: 'integer',
+      nullable: true,
+    },
     fileSystemId: {name: 'file_system_id', type: 'integer'},
   },
   relations: {
@@ -42,11 +48,20 @@ export const ContainerSchema = new EntitySchema<ContainerRow>({
       target: 'ContainerPropertyData',
       inverseSide: 'container',
     },
+    containerType: {
+      type: 'many-to-one',
+      target: 'ContainerType',
+      joinColumn: {
+        name: 'container_type_system_id',
+        referencedColumnName: 'systemId',
+      },
+      nullable: true,
+    },
     file: {
       type: 'many-to-one',
       target: 'ArcDbFile',
       joinColumn: {name: 'file_system_id', referencedColumnName: 'systemId'},
-      onDelete: 'CASCADE', // delete file => delete containers
+      onDelete: 'CASCADE',
     },
   },
   indices: [

@@ -70,6 +70,7 @@ export class DbUseCaseQueryService implements UseCaseQueryService {
       )
       .leftJoinAndSelect('node.spfModule', 'spfModule')
       .leftJoinAndSelect('spfModule.container', 'container')
+      .leftJoinAndSelect('container.containerType', 'containerType')
       .leftJoinAndSelect('spfModule.subgraph', 'subgraph')
       .leftJoinAndSelect('node.dataPorts', 'dataPort')
       .leftJoinAndSelect('node.controlPorts', 'controlPort')

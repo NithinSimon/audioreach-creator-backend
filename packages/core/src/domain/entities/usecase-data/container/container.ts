@@ -8,7 +8,7 @@ import {ContainerPropertyValue} from './value-objects/container-property.js';
 export class Container {
   public systemId: number;
   public containerId: number;
-  public type: string;
+  public containerTypeSystemId: number | null;
   public fileSystemId: number;
 
   public properties: Map<number, ContainerPropertyValue>;
@@ -16,12 +16,12 @@ export class Container {
   constructor(
     systemId: number,
     containerId: number,
-    type: string,
+    containerTypeSystemId: number | null,
     fileSystemId: number,
   ) {
     this.systemId = systemId;
     this.containerId = containerId;
-    this.type = type;
+    this.containerTypeSystemId = containerTypeSystemId;
     this.fileSystemId = fileSystemId;
 
     this.properties = new Map<number, ContainerPropertyValue>();
