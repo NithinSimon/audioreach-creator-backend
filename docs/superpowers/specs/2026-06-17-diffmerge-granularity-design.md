@@ -327,7 +327,7 @@ POST /unstage-changes { changeIds: number[] }
 
 `changeIds` in the request can be:
 - A single `ChangeUnitDto.changeId` — stage one logical unit
-- `ChangeNodeDto.changeIds` — stage an entire entity or subtree in one call
+- `EntityChangeDto.changeIds` — stage an entire entity or subtree in one call
 
 The server updates `change_status` for all provided `changeId` values atomically.
 
@@ -404,7 +404,7 @@ All existing entity get APIs return clean DTOs with no change metadata. They con
 ```typescript
 interface DiffMergeChangeSummaryDto {
   sessionId: number;
-  aggregates: ChangeNodeDto[];
+  aggregates: EntityChangeDto[];
 }
 
 /**
@@ -414,7 +414,7 @@ interface DiffMergeChangeSummaryDto {
  * changeIds is a pre-computed roll-up of all independently-stageable changeIds
  * in this subtree — pass directly to Stage/Unstage to act on the whole subtree.
  */
-interface ChangeNodeDto {
+interface EntityChangeDto {
   entityType: string;                           // "SpfModule", "Ckv", "ParameterPayload", …
   systemId: number;
   displayName: string;                          // human-readable label (alias, name, etc.)
@@ -422,7 +422,7 @@ interface ChangeNodeDto {
   changeIds: number[];                          // own unit changeIds + all descendant changeIds
   status: "STAGED" | "UNSTAGED" | "PARTIAL";   // PARTIAL = some staged, some not
   changeUnits: ChangeUnitDto[];                 // independently-stageable units for this entity
-  childChanges: ChangeNodeDto[];                // child entities — same shape, recursive
+  childChanges: EntityChangeDto[];                // child entities — same shape, recursive
 }
 
 /**
@@ -470,7 +470,7 @@ node.changeIds = deduplicate([
 
 **atomic groups.** When multiple fields must always be staged together (e.g. `paramDefinition`), the tool writes them as one `edit_action` row with a single `field_group`. They appear as one `changeUnit` with multiple `fields`. Staging `changeId=503` stages all fields in that unit atomically.
 
-**CREATE children.** For a large aggregate being added (e.g. a module with 5 CKVs), each independently-selectable CKV appears as a child `ChangeNodeDto` with its own `changeUnit`. The user stages 2 of 5 CKV nodes to bring only those CKVs into the Target file.
+**CREATE children.** For a large aggregate being added (e.g. a module with 5 CKVs), each independently-selectable CKV appears as a child `EntityChangeDto` with its own `changeUnit`. The user stages 2 of 5 CKV nodes to bring only those CKVs into the Target file.
 
 ### 8.3 Example
 
