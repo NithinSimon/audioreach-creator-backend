@@ -391,15 +391,150 @@ POST /arc-api/v1/projects/:projectId/unstage-changes
 Body: { changeIds: number[] }
 ```
 
-### 7.4 Existing Get APIs (unchanged)
+### 7.4 Existing Get APIs — optional diff extension
 
-All existing entity get APIs return clean DTOs with no change metadata. They continue to use the read overlay and work identically in DIFF_MERGE sessions. The DiffMerge UI uses these to show the current effective state of the Target file.
+All existing entity get APIs return clean entity DTOs by default — no change metadata, behaviour unchanged. Callers opt in to diff context by passing `?includeDiff=true`. The response shape is the same entity DTO with an optional `diffEntity` field populated (§8).
+
+```
+GET /arc-api/v1/projects/:projectId/spf-modules/query               → SpfModuleDto[]
+GET /arc-api/v1/projects/:projectId/spf-modules/query?includeDiff=true → SpfModuleDto[] with diffEntity populated
+```
+
+Works in any session mode: DESIGNER, DIFF_MERGE, or READ-ONLY (READ-ONLY returns no `diffEntity` since there are no pending changes).
 
 ---
 
-## 8. Change Summary DTO
+## 8. Entity DTO Diff Extension
 
-### 8.1 Types
+### 8.1 DiffEntityBase
+
+A single reusable type added as an optional field to every entity DTO. It carries the diff context for that entity — operation, staging state, and the independently-stageable change units.
+
+```typescript
+/**
+ * Diff context for one entity. Embedded as an optional field on entity DTOs.
+ * Absent when the entity has no pending changes or when ?includeDiff is not requested.
+ */
+interface DiffEntityBase {
+  operation: "CREATE" | "UPDATE" | "DELETE";
+  status: "STAGED" | "UNSTAGED" | "PARTIAL";
+  changeUnits: ChangeUnitDto[];
+}
+```
+
+Fields stripped vs the standalone `EntityChangeDto` (§9):
+
+| Field | Present in `EntityChangeDto` | Present in `DiffEntityBase` | Reason for omission |
+|---|---|---|---|
+| `entityType` | Yes | No | Implicit from the owning DTO type |
+| `systemId` | Yes | No | Already on the entity DTO |
+| `displayName` | Yes | No | Already a field on the entity DTO |
+| `changeIds` | Yes | No | Computable: `changeUnits.map(u => u.changeId)` |
+| `childChanges` | Yes | No | Each child entity carries its own `diffEntity` (§8.3) |
+
+### 8.2 How It Sits on Entity DTOs
+
+Every entity DTO gains exactly one optional field. Existing consumers that do not pass `?includeDiff=true` see no change.
+
+```typescript
+interface SpfModuleDto {
+  systemId: number;
+  alias: string;
+  containerSystemId: number;
+  // ... all other typed fields unchanged ...
+  diffEntity?: DiffEntityBase;
+}
+
+interface SubgraphDto {
+  systemId: number;
+  name: string;
+  // ...
+  diffEntity?: DiffEntityBase;
+}
+```
+
+### 8.3 DESIGNER vs DIFF_MERGE — Same Type, Different Grouping
+
+`DiffEntityBase` is identical in both modes. The difference is how many `changeUnits` the entity has, which is determined server-side by how `edit_actions` were written — not by the DTO type.
+
+**DESIGNER** — all field changes for an entity are accumulated into one `edit_action` row (one `field_group = NULL`). The entity always has exactly one `changeUnit`. All changed fields are listed inside it. `changeId` is present but the UI does not render staging controls.
+
+```json
+{
+  "systemId": 100,
+  "alias": "Mod2",
+  "containerSystemId": 200,
+  "diffEntity": {
+    "operation": "UPDATE",
+    "status": "STAGED",
+    "changeUnits": [
+      {
+        "changeId": 501,
+        "status": "STAGED",
+        "fields": [
+          { "fieldName": "alias",            "oldValue": "Mod1", "newValue": "Mod2" },
+          { "fieldName": "containerSystemId", "oldValue": 100,    "newValue": 200   }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**DIFF_MERGE** — each independent `field_group` is its own `edit_action` row. The entity can have multiple `changeUnits`, one per independently-stageable unit. The UI renders each as a selectable item.
+
+```json
+{
+  "systemId": 100,
+  "alias": "Mod2",
+  "containerSystemId": 100,
+  "diffEntity": {
+    "operation": "UPDATE",
+    "status": "PARTIAL",
+    "changeUnits": [
+      { "changeId": 501, "status": "STAGED",   "fields": [{ "fieldName": "alias",            "oldValue": "Mod1", "newValue": "Mod2" }] },
+      { "changeId": 502, "status": "UNSTAGED", "fields": [{ "fieldName": "containerSystemId", "oldValue": 100,    "newValue": 200   }] }
+    ]
+  }
+}
+```
+
+### 8.4 Children
+
+When an entity DTO includes child entities (e.g. a module response that includes its ports), each child also carries its own `diffEntity?` when `?includeDiff=true` is passed. There is no `childChanges` recursion in `DiffEntityBase` — every entity in the response is independently self-describing.
+
+```typescript
+interface SpfModuleDto {
+  systemId: number;
+  alias: string;
+  ports: DataPortDto[];          // each port has its own diffEntity
+  diffEntity?: DiffEntityBase;   // module's own changes only
+}
+
+interface DataPortDto {
+  systemId: number;
+  name: string;
+  diffEntity?: DiffEntityBase;   // port's own changes only
+}
+```
+
+### 8.5 oldValue Source
+
+For all modes, `oldValue` in `FieldChangeDto` is derived server-side at query time. The server reads the base row from the actual table and extracts the field value. No old values need to be passed in write requests.
+
+For CREATE operations, `oldValue` is `null` (entity did not exist). For DELETE, `newValue` is `null`.
+
+### 8.6 Relationship to EntityChangeDto
+
+`EntityChangeDto` (§9) is the standalone aggregate-tree type used in `DiffMergeChangeSummaryDto`. It carries all fields including `entityType`, `systemId`, `childChanges`, and `changeIds` roll-up because it has no surrounding entity DTO context. `DiffEntityBase` is a lean projection of the same information, stripped of everything the owning entity DTO already provides.
+
+Both use the same `ChangeUnitDto` and `FieldChangeDto` building blocks.
+
+---
+
+## 9. Change Summary DTO
+
+### 9.1 Types
 
 ```typescript
 interface DiffMergeChangeSummaryDto {
@@ -445,7 +580,7 @@ interface FieldChangeDto {
 }
 ```
 
-### 8.2 Design Rules
+### 9.2 Design Rules
 
 **One entity, one node.** `(entityType, systemId)` uniquely identifies a node. `SpfModule M` with two independent field changes has one node with two entries in `changeUnits` — not two separate nodes.
 
@@ -472,7 +607,7 @@ node.changeIds = deduplicate([
 
 **CREATE children.** For a large aggregate being added (e.g. a module with 5 CKVs), each independently-selectable CKV appears as a child `EntityChangeDto` with its own `changeUnit`. The user stages 2 of 5 CKV nodes to bring only those CKVs into the Target file.
 
-### 8.3 Example
+### 9.3 Example
 
 Module `Mod1` has two independent structural field changes, plus a CKV with an updated name whose child `ParameterPayload` table has one row updated (P1) and one row newly created (P2):
 
@@ -579,7 +714,7 @@ Module `Mod1` has two independent structural field changes, plus a CKV with an u
 
 ---
 
-## 9. Impact Summary
+## 10. Impact Summary
 
 ### What Changes
 
@@ -592,6 +727,8 @@ Module `Mod1` has two independent structural field changes, plus a CKV with an u
 | `OverlayMerge.applyToCollection` | Groups by `systemId`; applies merged result per group (§4.5) |
 | New: `POST /diff-merge/apply` | Writes UNSTAGED field-group changes, returns change summary (§7.1) |
 | New: `GET /diff-merge/changes` | Returns current change summary with live staged/unstaged state (§7.2) |
+| All entity get APIs | Accept optional `?includeDiff=true`; populate `diffEntity` on each returned DTO (§8) |
+| All entity DTOs | Add `diffEntity?: DiffEntityBase` field; default absent; existing consumers unaffected (§8.2) |
 
 ### What Does Not Change
 
@@ -600,7 +737,7 @@ Module `Mod1` has two independent structural field changes, plus a CKV with an u
 | DESIGNER mode behaviour | `field_group = NULL` rows hit the original constraint; accumulation unchanged |
 | Stage / Unstage API contract | Already operates per `changeId` and accepts lists |
 | Commit logic | Already applies partial payloads per STAGED row independently |
-| All existing get APIs | Return clean entity DTOs; overlay handles N rows transparently |
+| Entity DTO typed fields | All existing fields on every entity DTO are unchanged |
 | Session lifecycle (start, commit, end-session) | Unchanged |
 | `groupId` semantics | Still used for undo/redo atomicity; orthogonal to `field_group` |
 | `base_version` and optimistic locking | Unchanged; captured per field-group row at first write |
