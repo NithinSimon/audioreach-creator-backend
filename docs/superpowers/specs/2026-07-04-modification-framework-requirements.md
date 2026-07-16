@@ -126,7 +126,9 @@ These requirements define **what** the write path of the AudioReach Creator Back
 
 **REQ-EA-04 (Auto-staged by user):** All user-initiated write API calls shall produce edit-actions with `changeStatus = STAGED`, regardless of session mode. No separate staging call shall be required for user-initiated writes in either `DESIGNER` or `DIFF_MERGE` mode. (See REQ-SESS-12 for the DIFF_MERGE-specific rationale.)
 
-**REQ-EA-05 (Algorithm-produced changes are UNSTAGED):** Changes produced by algorithmic writers — including the diff-compare tool's apply-diff operation and the auto-routing algorithm — shall be created with `changeStatus = UNSTAGED`. Promotion to `STAGED` requires an explicit user action through the staging mechanism appropriate to the writer: the DiffMerge Stage API (§12) for diff-tool changes, and the auto-routing stage API (defined in the auto-usecase-routing spec) for auto-routed UseCases.
+**REQ-EA-05 (Algorithm-produced changes — default UNSTAGED, diff-tool may override):** Changes produced by algorithmic writers shall default to `changeStatus = UNSTAGED`. Promotion to `STAGED` requires an explicit user action through the staging mechanism appropriate to the writer: the DiffMerge Stage API (§12) for diff-tool changes, and the auto-routing stage API (defined in the auto-usecase-routing spec) for auto-routed UseCases.
+
+The diff-compare tool MAY override this default on a per-apply-diff-call basis when the user configures it — producing rows with `changeStatus = STAGED` directly for workflows where up-front review is not required. When the tool applies its writes as `STAGED`, they behave identically to user-manual STAGED writes: they are committed by the next commit call and do not appear as items awaiting selection in the change summary. Auto-routing does not support this override and always produces `UNSTAGED` rows.
 
 ### 4.3 Payload Rules by Operation
 
