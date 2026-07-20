@@ -18,7 +18,7 @@
 ## 1. Purpose & Scope
 
 - One paragraph on this LLD's role — the foundation layer that unblocks LLD2 (Module Write Path), LLD3 (Read Overlay), LLD4 (Commit), and all Phase 2 work.
-- **In scope:** items in §15 of overall-design under LLD1 — schema + migration, `PendingChangeWriter`, `EditActionsQueryService`, `OverlayMerge`, `PendingChangeCache`, `SessionGuard`, session hand-off via `execute(cmd, {session})` (Pattern A), `WriteContext` on UoW + `groupId` stamping, `CommandBus` mode check.
+- **In scope:** items in §15 of overall-design under LLD1 — schema + migration, `PendingChangeWriter`, `EditActionsQueryService`, `OverlayMerge`, `PendingChangeCache`, `SessionGuard`, session hand-off via `execute(cmd, session?)` (Pattern A), `WriteContext` on UoW + `groupId` stamping, `CommandBus` session-required + mode-allow-list checks with three command categories (Case 1/2/3 per §7a).
 - **Out of scope:** edit repos per aggregate (LLD2), read-service adapters per aggregate (LLD3), commit service (LLD4), stage/unstage (LLD4), delete cascade (LLD5), DiffMerge (LLD6a-c).
 
 ---
@@ -54,10 +54,10 @@ LLD1 delivers the shared plumbing every later LLD depends on. It touches all thr
 │  @arc/api                                                              │
 │                                                                        │
 │    SessionGuard                                                        │
-│      - Depends on: ProjectSessionQueryRepository port                  │
+│      - Depends on: ISessionRepository port (§7b.3)                     │
 │      - Attaches session → request.arcSession                           │
 │                                                                        │
-│    SessionModeNotAllowedError filter                                   │
+│    SessionRequiredError filter, SessionModeNotAllowedError filter      │
 │      - Maps to 403 with structured body                                │
 └──────────────────────────┬─────────────────────────────────────────────┘
                            │
@@ -65,21 +65,20 @@ LLD1 delivers the shared plumbing every later LLD depends on. It touches all thr
 ┌────────────────────────────────────────────────────────────────────────┐
 │  @arc/core                                                             │
 │                                                                        │
-│    BaseCommand (extended)  ← static readonly allowedModes              │
-│    CommandBus (extended)   ← ActiveSession arg + mode check           │
+│    BaseCommand (extended)  ← static requiresSession + allowedModes     │
+│    CommandBus (extended)   ← optional session arg + required+mode check│
 │                                                                        │
 │    change-vocabulary.ts (extended)  ← + SOURCE enum                    │
 │    ActiveSession (new)    { sessionId, mode, fileSystemId, projectId? }│
 │    WriteContext (new)     { session: ActiveSession, groupId: string }  │
-│    SessionModeNotAllowedError (new)                                    │
+│    SessionRequiredError (new), SessionModeNotAllowedError (new)        │
 │                                                                        │
 │    UnitOfWork port (extended):                                         │
 │      + setWriteContext(ctx) / getWriteContext()                        │
-│      + getPendingChangeCache() / applyCachedActions()                  │
+│      + applyCachedActions()                                            │
 │                                                                        │
 │    New ports:                                                          │
-│      - ProjectSessionQueryRepository (session lookup)                  │
-│      - PendingChangeCache (interface only; adapter in persistence)     │
+│      - ISessionRepository (session lifecycle + lookup — §7b.3)         │
 └──────────────────────────┬─────────────────────────────────────────────┘
                            │  port adapters
                            ▼
@@ -96,7 +95,7 @@ LLD1 delivers the shared plumbing every later LLD depends on. It touches all thr
 │      - field-path-reducer.ts (new)                                     │
 │                                                                        │
 │    repositories/session:                                               │
-│      - typeorm-project-session-query.repository.ts (new)               │
+│      - typeorm-session.repository.ts (new)                             │
 │                                                                        │
 │    services:                                                           │
 │      - pending-change-writer.ts (rewrite of former staging service)    │
@@ -113,8 +112,8 @@ LLD1 delivers the shared plumbing every later LLD depends on. It touches all thr
 **Integration points at boundaries:**
 
 - **`CommandBus` ↔ `UoW`:** CommandBus receives an `ActiveSession` on `execute()`, creates a UoW via existing factory, calls `uow.setWriteContext({ session, groupId: uuid() })` before starting the transaction. Handler receives `(cmd, uow)`.
-- **`SessionGuard` ↔ port:** Guard depends on `ProjectSessionQueryRepository` (core port). Wired via NestJS DI to the persistence adapter.
-- **`PendingChangeWriter` ↔ `UoW`:** Writer reads `uow.getWriteContext()` for `sessionId`, `mode`, `groupId`. Reads `uow.getPendingChangeCache()` when caller passes `cache: true`.
+- **`SessionGuard` ↔ port:** Guard depends on `ISessionRepository` (core port). Calls `findActiveSessionByProjectId(projectId)` for the request's project. Wired via NestJS DI to the persistence adapter.
+- **`PendingChangeWriter` ↔ `UoW`:** Writer reads `uow.getWriteContext()` for `sessionId`, `mode`, `groupId`. When constructed with `cache: true`, the writer holds a `PendingChangeCache` (persistence-internal, not a core port) that buffers row-shaping work until `uow.applyCachedActions()` flushes it.
 - **Read-service adapters (LLD3+) ↔ `EditActionsQueryService` + `OverlayMerge`:** every read service will construct with these dependencies. LLD1 delivers them; LLD3 wires them into each aggregate's read adapter.
 - **Aggregate edit-repo adapters (LLD2+) ↔ `PendingChangeWriter`:** every edit repo will inject the writer and delegate all row-shaping to it. LLD1 delivers the writer; LLD2 wires it.
 
@@ -212,6 +211,15 @@ Per `CLAUDE.md` §Database Migration Workflow:
 - `SOURCE` (`MANUAL / DIFF_TOOL / AUTO_ROUTING`) — enum + type export.
 - Location: `packages/core/src/application/shared/change-vocabulary.ts` (extend existing file).
 
+### 6.3 `ISSUE_ENTITY_TYPE` extension
+
+The core-result-format design (`docs/core-result-format/design/core-result-format-design.md` §2.3) defines `ISSUE_ENTITY_TYPE` in `packages/core/src/shared/issues/impacted-entity.ts` with these values: `SpfModule, DataLink, ControlLink, Subgraph, UseCase, Container, SpfModuleDefinition`.
+
+LLD1 extends it with:
+- **`Project`** — used by `StartSessionHandler` when `projectId` doesn't resolve to a file (§7b).
+
+Downstream LLDs may extend further (e.g., LLD2 adds `DataPort`, `ControlPort`, `Subsystem`).
+
 ---
 
 ## 7. `SessionGuard` (`@arc/api`)
@@ -225,9 +233,9 @@ Per `CLAUDE.md` §Database Migration Workflow:
 
 ### 7.2 Trigger mechanism
 
-- NestJS guard applied to controllers/endpoints that require an active session (write endpoints, session-scoped read endpoints).
+- NestJS guard applied to controllers/endpoints whose command declares `requiresSession = true` (Case 1 and Case 2 — see §7a).
 - Applied via `@UseGuards(SessionGuard)` on controller classes or specific methods.
-- Read-only endpoints that do not require a session (e.g., static definition reads) omit the guard.
+- Read-only endpoints and Case-3 endpoints (`requiresSession = false` — e.g., `start-session`, `upload-file`, `acknowledge-data-loss`) omit the guard. Boot-time cross-check (§7a.7) enforces this pairing at startup.
 
 ### 7.3 Failure modes
 
@@ -241,74 +249,318 @@ Per `CLAUDE.md` §Database Migration Workflow:
 
 ### 7.5 Session query port
 
-- New port in core: `ProjectSessionQueryRepository.findActiveSessionByProjectId(projectId): Promise<ProjectSession | null>`.
+- Uses `ISessionRepository.findActiveSessionByProjectId(projectId): Promise<ProjectSession | null>` (§7b.3). Single port for both SessionGuard and session-lifecycle handlers.
 - Adapter in persistence: joins `projects` → `project_sessions WHERE status = 'ACTIVE'` in one SQL round-trip.
 - Same pattern as the existing read-side `ProjectQueryService.getFileIdByProjectId(projectId)` — read APIs already use `projectId` in URLs and resolve to `fileSystemId` internally. Write APIs match this convention.
 
 ---
 
-## 7a. CommandBus Mode-Check (`@arc/core`)
+## 7a. CommandBus Session & Mode Enforcement (`@arc/core`)
 
 ### 7a.1 Responsibility
 
-- Enforce REQ-SESS-06: every write API call has a declared session-mode allow-list; disallowed mode → `403 Forbidden`.
+- Enforce REQ-SESS-06: every command declares whether it needs an active session, and if so which session-modes are permitted.
 - Applies to every command that flows through the CommandBus regardless of dispatch origin (direct controller, `FixCommandDispatcher`, future batch/retry endpoints).
+- Three command categories (see §7a.2 for declaration form):
+  - **Session-scoped, mode-restricted** — needs session, only listed modes accepted (e.g., `PatchSpfModuleCommand` → `[DESIGNER]`). Writes go to `edit_actions` overlay via edit-repos.
+  - **Session-scoped, mode-agnostic** — needs session, any mode accepted (e.g., `EndSessionCommand`). Overlay writes.
+  - **Session-agnostic** — no active session required; runs when file is open in read-only state (e.g., `StartSessionCommand`, `UploadFileCommand`, `AcknowledgeDataLossCommand`). Writes go **directly to real entity tables** via existing entity repositories (`IProjectRepository`, `IFileRepository`, etc.). Do not use `PendingChangeWriter` and do not touch `edit_actions`.
 
 ### 7a.2 Command-side declaration
 
-Every command class declares its allowed modes as a plain static field:
+Every command class declares two plain static fields:
 
 ```
-export class SetModuleAliasCommand extends BaseCommand {
-  static readonly allowedModes: readonly SessionMode[] = [SESSION_MODE.Designer];
+export class BaseCommand {
+  static readonly requiresSession: boolean            = true    // safest default
+  static readonly allowedModes:    readonly SessionMode[] = []  // empty = any mode (only meaningful when requiresSession = true)
+}
+
+// Case 1 — session + specific mode
+export class PatchSpfModuleCommand extends BaseCommand {
+  static readonly requiresSession = true
+  static readonly allowedModes    = [SESSION_MODE.Designer]
   ...
 }
 
 export class AddModuleCommand extends BaseCommand {
-  static readonly allowedModes: readonly SessionMode[] = [
-    SESSION_MODE.Designer,
-    SESSION_MODE.DiffMerge,
-  ];
+  static readonly requiresSession = true
+  static readonly allowedModes    = [SESSION_MODE.Designer, SESSION_MODE.DiffMerge]
+  ...
+}
+
+// Case 2 — session + any mode (session-lifecycle, session-neutral admin)
+export class EndSessionCommand extends BaseCommand {
+  static readonly requiresSession = true
+  static readonly allowedModes    = []       // end-session valid in any mode
+  ...
+}
+
+// Case 3 — no session required (writes directly to real entity tables)
+export class StartSessionCommand extends BaseCommand {
+  static readonly requiresSession = false
+  static readonly allowedModes    = []
+  ...
+}
+
+export class UploadFileCommand extends BaseCommand {
+  static readonly requiresSession = false
+  static readonly allowedModes    = []
   ...
 }
 ```
 
-- `BaseCommand` declares `static readonly allowedModes: readonly SessionMode[] = []` as the base.
-- Empty array = mode check is a no-op for that command (used for commands that don't require an active session, e.g., start-session).
+- `requiresSession = true, allowedModes.length > 0` → Case 1.
+- `requiresSession = true, allowedModes.length === 0` → Case 2 ("any mode").
+- `requiresSession = false` → Case 3. `allowedModes` is irrelevant and must be empty.
 - Pure TypeScript — no NestJS import, no reflect-metadata. Compatible with React Native consumers.
 
 ### 7a.3 Bus-side enforcement
 
-Before starting a transaction and invoking the handler, `CommandBus.execute()` runs the mode check:
+`CommandBus.execute(cmd, session?)` accepts an optional `ActiveSession`. It performs both checks up front, then conditionally sets `WriteContext`, then invokes the handler. **CommandBus does not manage transactions** — that responsibility stays with each handler (see §7a.7):
 
 ```
-CommandBus.execute(cmd):
-  ctx = uow.getWriteContext()
-  allowedModes = (cmd.constructor as typeof BaseCommand).allowedModes
-  if allowedModes.length > 0 and !allowedModes.includes(ctx.session.mode):
-    throw new SessionModeNotAllowedError(cmd.constructor.name, ctx.session.mode, allowedModes)
-  // proceed: startTransaction → stamp groupId on ctx → invoke handler → commit/rollback
+CommandBus.execute(cmd, session?):
+  const Ctor = cmd.constructor as typeof BaseCommand
+
+  // 1. Session requirement
+  if Ctor.requiresSession && !session:
+    throw new SessionRequiredError(Ctor.name)
+
+  // 2. Mode gate (only meaningful when a session is present)
+  if session && Ctor.allowedModes.length > 0 && !Ctor.allowedModes.includes(session.mode):
+    throw new SessionModeNotAllowedError(Ctor.name, session.mode, Ctor.allowedModes)
+
+  // 3. WriteContext setup — only when a session is present.
+  //    Case-3 handlers use existing entity repos (IProjectRepository etc.) that do not
+  //    read WriteContext, so no context is set.
+  if session:
+    uow.setWriteContext({ session, groupId: uuidv4() })
+
+  // 4. Invoke the handler. Handler owns transaction lifecycle (see §7a.7).
+  return handler.handle(cmd, uow)
 ```
 
-Placement: **before** `startTransaction()` so rejected calls do not open a transaction.
+Placement: both checks run **before** the handler is invoked, so rejected calls never reach handler code or open a transaction.
 
-### 7a.4 Error mapping (`@arc/api`)
+### 7a.4 Transaction ownership — handlers, not the bus
 
-- `SessionModeNotAllowedError` mapped to `403 Forbidden` by an exception filter.
-- Response body includes: current mode, allowed modes, command type name.
+**Handlers own `uow.startTransaction() / commit() / rollback()`.** Reasons:
 
-### 7a.5 Interaction with `SessionGuard`
+- **Multi-phase handlers need multiple transactions.** `UploadFileHandler` parses the ACDB file in phases (header parse → bulk insert entities → status update); each phase commits independently so partial progress isn't lost on a downstream failure. A blanket command-scoped transaction breaks this pattern.
+- **Handler-local knowledge.** Only the handler knows whether its work is one logical unit (single transaction wrapping the whole body) or a sequence of independently-durable phases (multiple transactions).
+- **Preserves the existing convention.** Every current handler (e.g., `UploadFileHandler`, `AcknowledgeDataLossHandler`) already drives its own transaction. LLD1 does not change this contract.
 
-- `SessionGuard` runs first — resolves session → attaches to UoW.
-- If SessionGuard rejects (no active session), the request never reaches CommandBus.
-- If SessionGuard passes, CommandBus performs the mode check using the attached session.
-- Commands with `allowedModes = []` (e.g., session-lifecycle commands like start/end) still require the guard to pass, but the mode check is a no-op — the command works regardless of mode.
+Convention for LLD1/LLD2 write handlers (single logical unit):
 
-### 7a.6 Testing
+```ts
+async handle(cmd, uow): Promise<Result<WriteResult>> {
+  await uow.startTransaction()
+  try {
+    // ... domain work, edit-repo calls, applyCachedActions() if using cached bulk mode ...
+    await uow.commit()
+    return Result.ok({ groupId: uow.getWriteContext().groupId })
+  } catch (err) {
+    await uow.rollback()
+    throw err
+  }
+}
+```
 
-- Unit test: command dispatched with a matching mode → passes; dispatched with a disallowed mode → throws `SessionModeNotAllowedError`.
-- Unit test: command with empty `allowedModes` → passes regardless of mode.
-- Integration test: end-to-end request through SessionGuard + CommandBus with a session in wrong mode → returns 403.
+Multi-phase handlers (e.g., `UploadFileHandler`) open/close multiple transactions inside `handle()` as their business logic requires. `WriteContext` is set once by CommandBus and persists across all sub-transactions — so every `edit_actions` row written by any sub-transaction of a single command dispatch carries the same `groupId` (correct: one API call → one groupId regardless of internal transaction boundaries).
+
+### 7a.5 Error mapping (`@arc/api`)
+
+- `SessionRequiredError` mapped to `403 Forbidden` by an exception filter.
+- `SessionModeNotAllowedError` mapped to `403 Forbidden` by the same/adjacent filter.
+- Both response bodies include: command type name, and (for the mode variant) current mode + allowed modes.
+
+### 7a.6 Interaction with `SessionGuard`
+
+- Endpoints for **Case 1** and **Case 2** commands apply `@UseGuards(SessionGuard)`; the guard resolves session → attaches to request; CommandBus receives it in `execute(cmd, session)`.
+- Endpoints for **Case 3** commands do **not** apply `SessionGuard`; CommandBus receives `session = undefined`.
+- If SessionGuard rejects (no active session, wrong project, etc.), the request never reaches CommandBus.
+- Case-2 commands: guard-check passes; CommandBus mode-check is a no-op because `allowedModes = []`. Command runs regardless of mode.
+- Case-3 commands: no guard runs; `requiresSession = false` short-circuits the session check.
+
+### 7a.7 Boot-time wiring cross-check (`@arc/api`)
+
+To catch the "forgot `@UseGuards(SessionGuard)` on a Case-1/2 endpoint" wiring bug at startup instead of runtime, the API module runs a one-shot assertion during `onApplicationBootstrap`:
+
+- Iterate every controller route registered with the CommandBus.
+- Look up the command class the route dispatches (via a route → command registry, or via reflect-metadata on the controller method).
+- Assert: `Ctor.requiresSession === true` ⇒ the route (or its controller) has `SessionGuard` in `@UseGuards`.
+- Assert: `Ctor.requiresSession === false` ⇒ the route does **not** apply `SessionGuard` (avoids silently attaching a session that the command declared it doesn't need).
+- Failure logs the offending route + command and aborts app boot with a clear message.
+
+`reflect-metadata` usage stays in `packages/api` (adapter layer). `packages/core` remains framework-free.
+
+### 7a.8 Testing
+
+- Unit test: Case-1 command dispatched with matching mode → passes; disallowed mode → throws `SessionModeNotAllowedError`.
+- Unit test: Case-2 command → passes regardless of mode.
+- Unit test: Case-3 command with `session = undefined` → passes; `requiresSession = true` command with `session = undefined` → throws `SessionRequiredError`.
+- Integration test: end-to-end request through SessionGuard + CommandBus with a session in wrong mode → 403.
+- Boot-test: mis-wired endpoint (Case-1 command without SessionGuard) fails app startup with a clear error.
+
+---
+
+## 7b. Session Lifecycle Handlers (`@arc/core`)
+
+The API endpoints `POST /projects/:projectId/start-session` and `POST /projects/:projectId/end-session` currently exist as stubs (throw `NotImplementedException`). LLD1 delivers their handlers — they're the foundation for every downstream write LLD.
+
+### 7b.1 StartSessionCommand + Handler
+
+Command:
+```ts
+// packages/core/src/application/edit-session/start-session/start-session.command.ts
+export class StartSessionCommand extends BaseCommand {
+  // Case 3 — no session required (session is the very thing we're creating).
+  static readonly requiresSession = false
+  static readonly allowedModes:    readonly SessionMode[] = []
+
+  constructor(
+    public readonly projectId: string,
+    public readonly clientId:  string,           // from request context; also passed to BaseCommand
+    public readonly mode:      SessionMode,      // DESIGNER / DIFF_MERGE / TUNING / DISCOVERY_WIZARD
+    public readonly userId?:   string,
+  ) { super(clientId) }
+}
+```
+
+The controller constructs `new StartSessionCommand(dto.projectId, dto.clientId, dto.mode, dto.userId)` inline from the request DTO. No `fromPayload` — session lifecycle is not a validation auto-fix action, so `FixCommandDispatcher` will never dispatch it. Add `fromPayload` only if that changes.
+
+Handler:
+```ts
+export class StartSessionHandler implements CommandHandler<StartSessionCommand, Result<SessionResult>> {
+  async handle(cmd: StartSessionCommand, uow: UnitOfWork): Promise<Result<SessionResult>> {
+    await uow.startTransaction()
+    try {
+      const sessionRepo = uow.getSessionRepository()
+
+      // 1. Resolve projectId → fileSystemId
+      const fileSystemId = await sessionRepo.findFileSystemIdByProjectId(cmd.projectId)
+      if (fileSystemId === null) {
+        await uow.rollback()
+        return Result.fail(IssueFactory.notFound(ISSUE_ENTITY_TYPE.Project, /* projectId */))
+      }
+
+      // 2. Enforce I1: no ACTIVE session for this file may already exist.
+      const existing = await sessionRepo.findActiveSessionByFileSystemId(fileSystemId)
+      if (existing) {
+        await uow.rollback()
+        return Result.fail({
+          code:     'ARC-SESSION-ALREADY-ACTIVE',
+          message:  `An active session already exists for project ${cmd.projectId} (sessionId ${existing.sessionId}, mode ${existing.mode}). End it before starting a new one.`,
+          severity: IssueSeverity.Error,
+        })
+      }
+
+      // 3. Insert new session row (unique partial index enforces I1 as a backstop).
+      const sessionId = await sessionRepo.createSession({
+        fileSystemId, clientId: cmd.clientId, sessionMode: cmd.mode, userId: cmd.userId ?? null,
+      })
+
+      await uow.commit()
+      return Result.ok({ sessionId, projectId: cmd.projectId, sessionMode: cmd.mode, summary: 'Session started.' })
+    } catch (err) {
+      await uow.rollback()
+      throw err
+    }
+  }
+}
+```
+
+### 7b.2 EndSessionCommand + Handler
+
+Command: `EndSessionCommand(projectId)` — declares `requiresSession = true`, `allowedModes = []` (Case 2 — any mode may end its own session). Session-existence enforced by SessionGuard on the endpoint; the empty `allowedModes` makes the CommandBus mode-check a no-op.
+
+Handler implements REQ-SESS-09 and REQ-SESS-10:
+
+```ts
+export class EndSessionHandler implements CommandHandler<EndSessionCommand, Result<SessionResult>> {
+  async handle(cmd: EndSessionCommand, uow: UnitOfWork): Promise<Result<SessionResult>> {
+    await uow.startTransaction()
+    try {
+      const session = uow.getWriteContext().session   // populated by CommandBus from SessionGuard's attach
+      const sessionRepo = uow.getSessionRepository()
+
+      // REQ-SESS-09: discard all UNSTAGED edit-actions for this session.
+      // Adapter runs a direct DELETE — no delegation to another persistence service.
+      const wipedCount = await sessionRepo.wipeUnstagedForSession(session.sessionId)
+
+      // REQ-SESS-10: retain session as audit history iff at least one commit was recorded;
+      //              else delete the session row entirely.
+      const commitCount = await sessionRepo.countCommitsForSession(session.sessionId)
+      if (commitCount === 0) {
+        await sessionRepo.deleteSession(session.sessionId)
+      } else {
+        await sessionRepo.markSessionEnded(session.sessionId)   // status: ACTIVE → ENDED
+      }
+
+      await uow.commit()
+      return Result.ok({
+        sessionId: session.sessionId,
+        projectId: session.projectId,
+        sessionMode: session.mode,
+        summary: commitCount > 0
+          ? `Session ended with ${commitCount} commit(s). ${wipedCount} unstaged change(s) discarded. Session retained as audit history.`
+          : `Session ended with no commits. ${wipedCount} unstaged change(s) discarded. Session record removed.`,
+      })
+    } catch (err) {
+      await uow.rollback()
+      throw err
+    }
+  }
+}
+```
+
+`SessionResult` type shape matches the existing `SessionResponseDto`:
+```ts
+type SessionResult = {
+  sessionId:   number
+  projectId:   string
+  sessionMode: SessionMode
+  summary:     string
+}
+```
+
+### 7b.3 `ISessionRepository` port (`@arc/core`) — new
+
+```ts
+export interface ISessionRepository {
+  // Session lookup — SessionGuard uses the composite; handlers use the two-step form
+  // to distinguish "project not found" (404) from "no active session" (a valid pre-create state).
+  findActiveSessionByProjectId(projectId: string): Promise<ProjectSession | null>
+  findFileSystemIdByProjectId(projectId: string): Promise<number | null>
+  findActiveSessionByFileSystemId(fileSystemId: number): Promise<ProjectSession | null>
+
+  createSession(row: {
+    fileSystemId: number, clientId: string, sessionMode: SessionMode, userId: string | null,
+  }): Promise<number>   // returns new sessionId
+
+  countCommitsForSession(sessionId: number): Promise<number>
+  deleteSession(sessionId: number): Promise<void>            // cascades to edit_actions + session_entity_versions via FK
+  markSessionEnded(sessionId: number): Promise<void>          // status: ACTIVE → ENDED + endedAt: NOW
+
+  // REQ-SESS-09 wipe of UNSTAGED rows on end-session.
+  // Adapter runs the DELETE inline (see §7b.3 adapter note).
+  wipeUnstagedForSession(sessionId: number): Promise<number>   // rows affected
+}
+```
+
+Adapter in `@arc/persistence`: straightforward TypeORM. The `wipeUnstagedForSession` implementation runs the delete directly — `DELETE FROM edit_actions WHERE session_id = ? AND change_status = 'UNSTAGED'` — no delegation to another persistence service. `EditActionsQueryService` remains pure-read (§11) per `docs/read-overlay-design.md` — not exposed via UoW.
+
+### 7b.4 Interaction with `SessionGuard`
+
+- `StartSessionCommand` endpoint (`POST /projects/:id/start-session`) — **no `@UseGuards(SessionGuard)`**. Starting a session doesn't require an existing session.
+- `EndSessionCommand` endpoint (`POST /projects/:id/end-session`) — **DOES have `@UseGuards(SessionGuard)`**. Ending a nonexistent session should 403.
+
+### 7b.5 Cleanup on end-session — order matters
+
+`deleteSession` cascades to `edit_actions` and `session_entity_versions` via existing FK constraints (ON DELETE CASCADE on `session_id`). No manual delete needed for these tables. The explicit `wipeUnstagedForSession(sessionId)` call in the handler is defensive — even if we go through the retain-as-audit path, unstaged rows are wiped (REQ-SESS-09).
+
+Applied STAGED rows on committed sessions are already deleted by the commit path (LLD4 concern). Superseded rows (`validUntil IS NOT NULL`) remain if the session is retained as audit history — they represent the session's write history and can be truncated by a separate audit-retention policy later if needed.
 
 ---
 
@@ -345,7 +597,7 @@ Explicit hand-off, no NestJS request-scope leakage into core. Note: every URL us
 1. Client → HTTP request to /arc-api/v1/projects/{projectId}/...
 2. SessionGuard (@arc/api):
      Reads projectId from request params.
-     Queries active session via ProjectSessionQueryPort.findActiveSessionByProjectId(projectId).
+     Queries active session via ISessionRepository.findActiveSessionByProjectId(projectId).
        Adapter resolves projectId → fileSystemId internally, joins project_sessions where status=ACTIVE.
      No active session → 403.
      Attaches to request:  request.arcSession = { sessionId, mode, fileSystemId, projectId }.  // ActiveSession
@@ -354,14 +606,16 @@ Explicit hand-off, no NestJS request-scope leakage into core. Note: every URL us
      Builds command:  cmd = new SetModuleAliasCommand(...)
      Calls:           commandBus.execute(cmd, request.arcSession)
 4. CommandBus (@arc/core):
-     Reads command.constructor.allowedModes.
-     Compares against session.mode → throws SessionModeNotAllowedError if mismatched.
+     Reads command.constructor.requiresSession and .allowedModes.
+     if requiresSession && !session → throws SessionRequiredError.
+     if session && allowedModes has entries && !allowedModes.includes(session.mode) → throws SessionModeNotAllowedError.
      Creates UoW.
-     uow.setWriteContext({ session, groupId: uuidv4() })
-     Starts transaction.
-     Invokes handler.
+     if session → uow.setWriteContext({ session, groupId: uuidv4() })   // Case-3 skips this
+     Invokes handler. (No transaction started by the bus — handler owns it. See §7a.4.)
 5. Handler (@arc/core):
+     Starts transaction (single-tx handler) OR opens multiple transactions across phases (multi-phase handler).
      Calls edit repo methods — passes only uow and domain args.
+     Commits on success / rolls back on failure.
 6. Edit repo adapter (@arc/persistence):
      Reads WriteContext from uow — uses ctx.session.sessionId, ctx.session.mode, ctx.groupId.
      Writes via PendingChangeWriter.
@@ -384,9 +638,11 @@ Core port shape:
 
 ```
 interface CommandBus {
+  // session is optional: Case-3 commands (requiresSession = false) are dispatched without one.
+  // CommandBus enforces the pairing per §7a.3.
   execute<T extends BaseCommand>(
     command: T,
-    session: ActiveSession,
+    session?: ActiveSession,
   ): Promise<CommandResult<T>>
 }
 ```
@@ -406,7 +662,6 @@ interface UnitOfWork {
   setWriteContext(ctx: WriteContext): void       // called by CommandBus once
   getWriteContext(): WriteContext                  // called by repos + writer
 
-  getPendingChangeCache(): PendingChangeCache
   applyCachedActions(): Promise<void>              // called by handler before commit
 }
 ```
@@ -417,7 +672,9 @@ Implementation on `TypeOrmUnitOfWork` in persistence.
 
 ## 9. `PendingChangeWriter` (`@arc/persistence`)
 
-Low-level service that writes rows to the `edit_actions` table. Called by aggregate edit repos (LLD2+), not by handlers directly. The former "EntityStagingService" — renamed because it does not perform staging (the `changeStatus = STAGED` flip). It records pending changes; whether those rows are STAGED or UNSTAGED depends on the caller's `source` + session mode.
+Low-level service that writes rows to the `edit_actions` table. Called by aggregate edit repos (LLD2+), not by handlers directly.
+
+**Note for execution — no existing service to replace.** Earlier design docs (`docs/superpowers/specs/2026-06-11-modification-framework-design.md`, `docs/modification-framework/modification-framework-design.md`) sketched an "EntityStagingService" but no implementation ever landed in the codebase — search under `packages/` returns doc-only hits. LLD1 delivers `PendingChangeWriter` as a fresh implementation. The naming choice (`PendingChangeWriter` instead of `EntityStagingService`) reflects that this service records pending changes; it does not perform staging (the `changeStatus = STAGED` flip). Whether rows are STAGED or UNSTAGED depends on the caller's `source` + session mode (§9.6).
 
 ### 9.1 Interface
 
@@ -492,12 +749,13 @@ In practice, the diff-stager sets `changeStatus` uniformly across all rows produ
 
 ## 10. `PendingChangeCache` and `applyCachedActions()`
 
-UoW-scoped in-memory buffer used for bulk write paths (DiffMerge apply, auto-routing) where individual INSERT-per-row would be too slow. Core defines the port; persistence provides the adapter.
+UoW-scoped in-memory buffer used for bulk write paths (DiffMerge apply, auto-routing) where individual INSERT-per-row would be too slow. **This is a persistence-internal class, not a core port** — core interacts with the cache only through `uow.applyCachedActions()`. `PendingChangeWriter` holds the cache directly and calls its enqueue methods; no core-facing use exists.
 
-### 10.1 Interface (core port)
+### 10.1 Persistence-internal interface
 
 ```
-interface PendingChangeCache {
+// packages/infrastructure/persistence — no core interface, class only
+class PendingChangeCache {
   enqueueRow(row: PendingChangeInsert): void
   enqueueBaseVersionCapture(target: { targetTable, targetSystemId }): void
 
@@ -505,11 +763,11 @@ interface PendingChangeCache {
   isEmpty(): boolean
 }
 
-// on UnitOfWork:
+// on UnitOfWork (core port):
 applyCachedActions(): Promise<void>   // performs the flush described in §10.2
 ```
 
-`PendingChangeInsert` is a persistence-shaped row insert spec — core sees it as opaque, treated as data that flows through. `PendingChangeWriter` constructs these when `cache: true`.
+`PendingChangeInsert` is a persistence-shaped row insert spec. `PendingChangeWriter` constructs these when `cache: true`.
 
 ### 10.2 Flush algorithm
 
@@ -567,16 +825,12 @@ Example — a 5000-change DiffMerge apply spanning ~2000 distinct entities acros
 
 ## 11. `EditActionsQueryService` (`@arc/persistence`)
 
-Raw pending-change queries. No overlay merge, no domain shaping. Rewritten from the existing service to reflect the new schema and to add source-filtering methods.
+Raw pending-change reads. No overlay merge, no domain shaping, no mutations — pure read side of `edit_actions`. Rewritten from the existing service to reflect the new schema and to add source-filtering methods. Delete operations on `edit_actions` live with the callers that own the business purpose (session-lifecycle wipe → `TypeOrmSessionRepository`; DiffMerge idempotent re-apply → `DiffMergeApplyService` in LLD6a).
 
 ### 11.1 Interface
 
 ```
 interface EditActionsQueryService {
-  // Session resolution (used by SessionGuard)
-  findActiveSession(fileSystemId: number): Promise<ProjectSessionRow | null>
-  // Also findActiveSessionByProjectId available on ProjectSessionQueryRepository (§7.5)
-
   // Fetch active pending rows
   getByAggregateId(
     sessionId: number,
@@ -603,13 +857,6 @@ interface EditActionsQueryService {
     options?: EditActionsQueryOptions,
   ): Promise<EditActionRow[]>
 
-  // Wipe-by-source (used by DiffMerge re-apply; details in LLD6a)
-  deleteBySource(
-    sessionId: number,
-    source: Source,
-    changeStatus?: ChangeStatus,   // optional filter; default no filter (wipes all)
-  ): Promise<number>   // rows affected
-
   // Session-scoped supersession lookup (used by PendingChangeWriter)
   findCurrentRow(
     sessionId: number,
@@ -618,6 +865,8 @@ interface EditActionsQueryService {
   ): Promise<EditActionRow | null>
 }
 ```
+
+Session lookup (`findActiveSession`) is **not** on this service — session queries belong to `ISessionRepository` (§7b.3). Delete methods (`deleteByStatus`, `deleteBySource`) are **not** on this service — see the caller-owned locations above.
 
 ### 11.2 `EditActionsQueryOptions`
 
@@ -638,7 +887,7 @@ All queries filter `valid_until IS NULL` implicitly — active rows only. No opt
 
 ### 11.4 Concurrency
 
-- All queries run against the current UoW's `queryRunner` when called during a transaction, or against the shared `DataSource` for read-only usage (SessionGuard).
+- All queries run against the current UoW's `queryRunner` when called during a transaction, or against the shared `DataSource` for read-only usage from persistence-internal read-service adapters (LLD3+).
 
 ---
 
@@ -761,12 +1010,12 @@ The reducer registry maps `(entity kind, structured-column name)` to a parse/nav
 
 ---
 
-### 12.4 Interfaces
+### 12.6 Interfaces
 
 - `applyToSingle<T>(baseRow, editActions[])` — merge N rows onto one base row.
 - `applyToCollection<T>(baseRows, editActions[])` — group by systemId, apply per group; CREATE actions produce new virtual rows.
 
-### 12.5 Diff context output
+### 12.7 Diff context output
 
 - Every changed field surfaces as a diff entry with `{ fieldName, oldValue, newValue, changeId, groupId, status, source, crossEntityGroupId? }`.
 - Consumed by read-service adapters to populate `diffEntity` on entity DTOs (LLD3).
@@ -787,10 +1036,12 @@ LLD1 provides only the foundation the commit service will build on: `edit_action
 ## 14. `UnitOfWork` Extensions
 
 - New port methods added to `packages/core/.../unit-of-work.ts`:
+  - `setWriteContext(ctx: WriteContext): void`                    // called once by CommandBus (§8.5)
   - `getWriteContext(): WriteContext`
-  - `getPendingChangeCache(): PendingChangeCache`
   - `applyCachedActions(): Promise<void>`
-- `TypeOrmUnitOfWork` implements — instantiates cache per request, wires into `PendingChangeWriter`.
+  - `getSessionRepository(): ISessionRepository`                  // §7b — session lifecycle
+- Existing methods on `UnitOfWork` (`startTransaction`, `commit`, `rollback`) are unchanged. Transaction lifecycle stays with handlers (§7a.4).
+- `TypeOrmUnitOfWork` implements — instantiates `PendingChangeCache` (persistence-internal) per request and wires it into `PendingChangeWriter`.
 - CommandBus populates WriteContext before invoking handler.
 
 ---
@@ -800,25 +1051,28 @@ LLD1 provides only the foundation the commit service will build on: `edit_action
 Full folder tree of files created or modified by this LLD.
 
 - `packages/core/src/application/shared/change-vocabulary.ts` — add `SOURCE` enum.
-- `packages/core/src/application/orchestration/cqrs/base-command.ts` — extend with `static readonly allowedModes: readonly SessionMode[] = []`.
-- `packages/core/src/application/orchestration/cqrs/command-bus.ts` — accept `ActiveSession` on `execute()`; add mode check before `startTransaction()`; construct `WriteContext = { session, groupId: uuidv4() }` and put on UoW; throw `SessionModeNotAllowedError` on mismatch.
+- `packages/core/src/application/orchestration/cqrs/base-command.ts` — extend with `static readonly requiresSession: boolean = true` and `static readonly allowedModes: readonly SessionMode[] = []`.
+- `packages/core/src/application/orchestration/cqrs/command-bus.ts` — accept optional `ActiveSession` on `execute()`; add session-required check + mode check before `startTransaction()`; construct `WriteContext = { session, groupId: uuidv4() }` and put on UoW **only when a session is present**; throw `SessionRequiredError` / `SessionModeNotAllowedError` on mismatch.
 - `packages/core/src/application/orchestration/cqrs/active-session.ts` — new `ActiveSession` type.
 - `packages/core/src/application/orchestration/cqrs/write-context.ts` — new `WriteContext = { session: ActiveSession, groupId: string }`.
-- `packages/core/src/application/orchestration/cqrs/errors.ts` — new `SessionModeNotAllowedError` (or extend existing error module).
-- `packages/core/src/application/ports/persistence/unit-of-work.ts` — extend with `setWriteContext()`, `getWriteContext()`, `getPendingChangeCache()`, `applyCachedActions()`.
-- `packages/core/src/application/ports/persistence/repositories/session/project-session-query.repository.ts` — new port (SessionGuard's session-lookup dependency).
-- `packages/core/src/application/ports/persistence/pending-change-cache.ts` — new port.
+- `packages/core/src/application/orchestration/cqrs/errors.ts` — new `SessionRequiredError` + `SessionModeNotAllowedError` (or extend existing error module).
+- `packages/core/src/application/edit-session/start-session/start-session.command.ts` + `.handler.ts` — §7b.
+- `packages/core/src/application/edit-session/end-session/end-session.command.ts` + `.handler.ts` — §7b.
+- `packages/core/src/application/ports/persistence/repositories/session/session.repository.ts` — new `ISessionRepository` port (§7b).
+- `packages/core/src/application/ports/persistence/unit-of-work.ts` — extend with `setWriteContext()`, `getWriteContext()`, `applyCachedActions()`.
 - `packages/infrastructure/persistence/src/persistence-typeorm-sqllite/entity-schema/edit-session/edit-action.schema.ts` — reshape.
 - `.../entity-schema/edit-session/session-entity-version.schema.ts` — new.
 - `.../queries/edit-session/edit-actions-query-service.ts` — rewrite.
 - `.../queries/edit-session/overlay-merge.ts` — rewrite.
 - `.../queries/edit-session/field-path-reducer.ts` — new.
-- `.../repositories/session/typeorm-project-session-query.repository.ts` — new (adapter for the core port).
-- `.../services/pending-change-writer.ts` — rewrite (replaces existing `entity-staging-service.ts`; rename reflects the change from "stage" verb to "record pending change").
-- `.../services/pending-change-cache.ts` — new (persistence adapter for the core port).
+- `.../repositories/session/typeorm-session.repository.ts` — new adapter for `ISessionRepository` (§7b). Serves both SessionGuard lookups and session-lifecycle handlers.
+- `.../services/pending-change-writer.ts` — new (§9). No existing service to supersede; earlier design docs referenced an "EntityStagingService" but no implementation ever landed.
+- `.../services/pending-change-cache.ts` — new persistence-internal class (not a core port; held by `PendingChangeWriter`, flushed via `uow.applyCachedActions()`).
 - `.../unit-of-work/typeorm-unit-of-work.ts` — extend with WriteContext + cache accessors.
-- `packages/api/src/guards/session-guard.ts` — new (active-session resolution only; uses `ProjectSessionQueryRepository` port).
+- `packages/api/src/guards/session-guard.ts` — new (active-session resolution only; uses `ISessionRepository` port).
 - `packages/api/src/filters/session-mode-not-allowed.filter.ts` — new (maps `SessionModeNotAllowedError` to 403).
+- `packages/api/src/filters/session-required.filter.ts` — new (maps `SessionRequiredError` to 403).
+- `packages/api/src/module/session-wiring-check.ts` — new (boot-time cross-check per §7a.7; asserts SessionGuard presence matches `requiresSession` for every registered command endpoint).
 - Migration file — regenerated `initial-create`.
 
 ---
@@ -836,11 +1090,12 @@ Full folder tree of files created or modified by this LLD.
 - In-memory SQLite with the new schema.
 - End-to-end: staging + query + overlay merge across an aggregate.
 - baseVersion capture through the side-table.
-- Wipe-by-source.
+- `TypeOrmSessionRepository.wipeUnstagedForSession` — inline DELETE removes only UNSTAGED rows for the target session; STAGED and superseded rows untouched.
 
 ### 16.3 E2E (`packages/api/tests/e2e`)
 
-- `SessionGuard` behavior — 403s for missing session / disallowed mode.
+- `SessionGuard` behavior — 403 for missing/inactive session on Case-1/2 endpoints.
+- `CommandBus` behavior — 403 for wrong-mode (Case 1) via `SessionModeNotAllowedError`; 403 for missing session on `requiresSession = true` command via `SessionRequiredError`; Case-3 command succeeds without a session.
 - End-to-end write → read overlay cycle with an existing SET handler stub (or deferred to LLD2 if no handlers land in LLD1).
 
 ---

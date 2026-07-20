@@ -76,7 +76,7 @@ The source of truth is `docs/superpowers/specs/2026-07-04-modification-framework
 
 Resolved open questions (from requirements §21):
 - **OQ-7** (Designer accumulation vs DiffMerge field-level granularity) — resolved via `fieldPath` addressing scheme (§4).
-- **OQ-8** (API-call tracking handle representation) — resolved: return both `groupId` and `changeIds` (§10 shows both accepted in `StageRequest`).
+- **OQ-8** (API-call tracking handle representation) — resolved: write API responses return `{ groupId }` (atomic-unit handle). `StageRequest` (§10) accepts `changeIds`, `groupIds`, or `crossEntityGroupIds` as selectors — the `changeIds` selector lets clients target specific rows resolved by follow-up query on `edit_actions WHERE group_id = ?`.
 - **OQ-4** (Manual STAGED overlapping tool UNSTAGED) — storage half resolved (distinct fieldPaths coexist); selection-panel semantics remain open for LLD6a.
 
 Still open at the framework level:
@@ -758,7 +758,7 @@ interface FieldChangeDto {
 
 `pendingChangeStatus` is always populated when the entity has pending changes — independent of `?includeDiff=true`. `diffEntity` is only present when opted in.
 
-**`groupId` is not on `ChangeUnitDto` — it is returned in write API responses only** (OQ-8: `{ groupId, changeIds }` from each write). Clients use the write response's `groupId` to update their client-side undo stack per REQ-UNDO-01. Read responses don't drive undo, so they omit `groupId` to save bandwidth on large GETs. Selection uses `changeId` (per unit) or `crossEntityGroupId` (atomic group); provenance uses `source`.
+**`groupId` is not on `ChangeUnitDto` — it is returned in write API responses only** (OQ-8: `{ groupId }` from each write; row-level `changeIds` resolved by follow-up query on `edit_actions WHERE group_id = ?` when a client explicitly needs per-row handles for staging). Clients use the write response's `groupId` to update their client-side undo stack per REQ-UNDO-01. Read responses don't drive undo, so they omit `groupId` to save bandwidth on large GETs. Selection uses `changeId` (per unit) or `crossEntityGroupId` (atomic group); provenance uses `source`.
 
 ### DESIGNER vs DIFF_MERGE — same DTO, different content
 

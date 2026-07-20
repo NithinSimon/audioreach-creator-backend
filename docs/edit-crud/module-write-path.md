@@ -82,18 +82,12 @@ LLD2 sits on top of LLD1's foundation. It adds aggregate-specific edit repos + C
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  @arc/core (application)                                                │
 │                                                                         │
-│    Commands (each declares static readonly allowedModes):               │
-│      SetModuleAliasCommand                                              │
-│      SetModuleContainerCommand                                          │
-│      AddDataPortCommand                                                 │
-│      AddControlPortCommand                                              │
+│    Commands (each declares static readonly requiresSession + allowedModes): │
+│      PatchSpfModuleCommand   (generic PATCH — alias, containerId, port counts)│
 │      AddModuleCommand                                                   │
 │                                                                         │
 │    Handlers (one per command; register in CommandHandlerRegistry):      │
-│      SetModuleAliasHandler                                              │
-│      SetModuleContainerHandler                                          │
-│      AddDataPortHandler                                                 │
-│      AddControlPortHandler                                              │
+│      PatchSpfModuleHandler                                              │
 │      AddModuleHandler                                                   │
 │                                                                         │
 │    Ports (new):                                                         │
@@ -146,7 +140,7 @@ LLD2 sits on top of LLD1's foundation. It adds aggregate-specific edit repos + C
 8. Edit repo adapter maps domain args → PendingChangeWriter call
      (fieldGroup + payload derived from mode + operation type).
 9. PendingChangeWriter (LLD1) writes edit_actions row(s), captures baseVersion.
-10. CommandBus commits transaction, returns { groupId, changeIds }.
+10. Handler commits transaction, returns Result.ok({ groupId }).
 ```
 
 ---
@@ -175,7 +169,7 @@ recordXxxChange(
 - **Domain-verb method names** — `renameModule`, `changeContainer`, `addDataPort`, `createModule`. Not `stage*`. The repository *class* (`IModuleEditRepository`) already conveys the "pending edit" nature.
 - **`sessionId`, `groupId`, `mode` are read from `uow.getWriteContext()`** inside the adapter. Never on the method signature.
 - **Options bag is optional.** DESIGNER handlers omit it entirely — defaults apply (`source = MANUAL`, `fieldGroup = null` (accumulator), `cache = false`).
-- **Return type `Promise<void>`.** Row identifiers are exposed at the CommandBus level (`{ groupId, changeIds }` in the write response); repo callers don't need per-write results.
+- **Return type `Promise<void>`.** The handler-level write response returns only `{ groupId }` (the atomic-unit handle); repo callers don't need per-write row identifiers. Consumers that need row-level detail can query `edit_actions WHERE group_id = ?`.
 
 ### 5.2 Handler pattern
 
@@ -632,6 +626,7 @@ export class PatchSpfModuleCommand extends BaseCommand {
   ]
 
   constructor(
+    clientId:                                string,   // for BaseCommand — request-scoped identifier
     public readonly moduleSystemId:          number,
     public readonly fileSystemId:            number,
     public readonly alias?:                  string,
@@ -639,71 +634,80 @@ export class PatchSpfModuleCommand extends BaseCommand {
     public readonly numberOfInputPorts?:     number,
     public readonly numberOfOutputPorts?:    number,
     public readonly numberOfControlPorts?:   number,
-  ) { super() }
-
-  static fromPayload(p: Record<string, unknown>): PatchSpfModuleCommand {
-    return new PatchSpfModuleCommand(
-      p.moduleSystemId          as number,
-      p.fileSystemId            as number,
-      p.alias                   as string | undefined,
-      p.containerSystemId       as number | undefined,
-      p.numberOfInputPorts      as number | undefined,
-      p.numberOfOutputPorts     as number | undefined,
-      p.numberOfControlPorts    as number | undefined,
-    )
-  }
+  ) { super(clientId) }
 }
 ```
 
-Handler:
+The controller constructs `new PatchSpfModuleCommand(...)` inline from the request DTO. No `fromPayload` yet — add it (and the matching `FixCommandDispatcher.registerAll()` line) if/when a validation rule surfaces this command as an auto-fix action.
+
+Handler — returns `Result<WriteResult>` per the core-result-format design (`docs/core-result-format/design/core-result-format-design.md`):
+
 ```ts
 // packages/core/src/application/module/patch/patch-spf-module.handler.ts
-export class PatchSpfModuleHandler implements CommandHandler<PatchSpfModuleCommand> {
+export class PatchSpfModuleHandler implements CommandHandler<PatchSpfModuleCommand, Result<WriteResult>> {
   constructor(
     private readonly idGeneration: IdGenerationPort,
   ) {}
 
-  async handle(command: PatchSpfModuleCommand, uow: UnitOfWork): Promise<void> {
-    const moduleRepo    = uow.getModuleEditRepository()
-    const containerRepo = uow.getContainerEditRepository()
-    const defRepo       = uow.getModuleDefinitionEditRepository()
-    const dataLinkRead  = uow.getDataLinkReadRepository()
-    const ctrlLinkRead  = uow.getControlLinkReadRepository()
-    const fileId = command.fileSystemId
+  async handle(command: PatchSpfModuleCommand, uow: UnitOfWork): Promise<Result<WriteResult>> {
+    await uow.startTransaction()
+    try {
+      const moduleRepo    = uow.getModuleEditRepository()
+      const containerRepo = uow.getContainerEditRepository()
+      const defRepo       = uow.getModuleDefinitionEditRepository()
+      const dataLinkRead  = uow.getDataLinkReadRepository()
+      const ctrlLinkRead  = uow.getControlLinkReadRepository()
+      const fileId = command.fileSystemId
 
-    // 0. Existence: the module.
-    const module = await moduleRepo.findModuleForPatch(command.moduleSystemId, fileId)
-    if (!module) throw new EntityNotFoundException('SpfModule', command.moduleSystemId)
+      // 0. Existence check
+      const module = await moduleRepo.findModuleForPatch(command.moduleSystemId, fileId)
+      if (!module) {
+        await uow.rollback()
+        return Result.fail(IssueFactory.notFound(
+          ISSUE_ENTITY_TYPE.SpfModule, command.moduleSystemId,
+        ))
+      }
 
-    // 1. alias — trivial rename
-    if (command.alias !== undefined) {
-      await moduleRepo.renameModule(command.moduleSystemId, command.alias, uow)
-    }
+      // 1. alias — trivial rename
+      if (command.alias !== undefined) {
+        await moduleRepo.renameModule(command.moduleSystemId, command.alias, uow)
+      }
 
-    // 2. containerSystemId — validate existence + type compatibility (§11.1.a)
-    if (command.containerSystemId !== undefined) {
-      await this.applyContainerChange(command.containerSystemId, module, defRepo, containerRepo, uow, moduleRepo, fileId)
-    }
+      // 2. containerSystemId — validate + change
+      if (command.containerSystemId !== undefined) {
+        const r = await this.applyContainerChange(command.containerSystemId, module, defRepo, containerRepo, uow, moduleRepo, fileId)
+        if (r.kind === 'fail') { await uow.rollback(); return r }
+      }
 
-    // 3-5. port-count changes — see §11.1.b
-    if (command.numberOfInputPorts !== undefined) {
-      await this.applyDataPortCountChange(module, 'INPUT', command.numberOfInputPorts, defRepo, dataLinkRead, moduleRepo, uow, fileId)
-    }
-    if (command.numberOfOutputPorts !== undefined) {
-      await this.applyDataPortCountChange(module, 'OUTPUT', command.numberOfOutputPorts, defRepo, dataLinkRead, moduleRepo, uow, fileId)
-    }
-    if (command.numberOfControlPorts !== undefined) {
-      await this.applyControlPortCountChange(module, command.numberOfControlPorts, defRepo, ctrlLinkRead, moduleRepo, uow, fileId)
+      // 3-5. port-count changes — each returns Result; short-circuit on fail
+      for (const [ioType, requested] of [
+        ['INPUT',   command.numberOfInputPorts]   as const,
+        ['OUTPUT',  command.numberOfOutputPorts]  as const,
+      ]) {
+        if (requested === undefined) continue
+        const r = await this.applyDataPortCountChange(module, ioType, requested, defRepo, dataLinkRead, moduleRepo, uow, fileId)
+        if (r.kind === 'fail') { await uow.rollback(); return r }
+      }
+      if (command.numberOfControlPorts !== undefined) {
+        const r = await this.applyControlPortCountChange(module, command.numberOfControlPorts, defRepo, ctrlLinkRead, moduleRepo, uow, fileId)
+        if (r.kind === 'fail') { await uow.rollback(); return r }
+      }
+
+      await uow.commit()
+      return Result.ok({ groupId: uow.getWriteContext().groupId })
+    } catch (err) {
+      await uow.rollback()
+      throw err
     }
   }
 }
 ```
 
-All writes staged within this handler share the same `groupId` via ambient WriteContext — the entire PATCH is one atomic undo step (REQ-ATO-01).
+All writes staged within this handler share the same `groupId` via ambient WriteContext — the entire PATCH is one atomic undo step (REQ-ATO-01). Handler owns transaction lifecycle per foundation §7a.4; each `Result.fail(...)` short-circuit rolls back before returning.
 
 ### 11.1.a Container change (with type-compatibility check)
 
-New domain rule: the target container's `containerTypeSystemId` must be in the module definition's `containerTypesSystemIds` allowed list.
+Returns `Result<void>` — chained by the top-level handler. Container-type-incompatibility is a structured domain issue, returned via `Result.fail`:
 
 ```ts
 private async applyContainerChange(
@@ -714,32 +718,44 @@ private async applyContainerChange(
   uow: UnitOfWork,
   moduleRepo: IModuleEditRepository,
   fileId: number,
-): Promise<void> {
+): Promise<Result<void>> {
   const container = await containerRepo.getContainerById(newContainerSystemId, fileId)
-  if (!container) throw new EntityNotFoundException('Container', newContainerSystemId)
+  if (!container) {
+    return Result.fail(IssueFactory.notFound(
+      ISSUE_ENTITY_TYPE.Container, newContainerSystemId,
+    ))
+  }
 
   const definition = await defRepo.findByModuleIdAndProcId(
-    module.moduleId, module.procId, fileId,   // fields available on SpfModuleReadModel
+    module.moduleId, module.procId, fileId,
   )
-  if (!definition) throw new EntityNotFoundException('SpfModuleDefinition', module.moduleId)
+  if (!definition) {
+    return Result.fail(IssueFactory.notFound(
+      ISSUE_ENTITY_TYPE.SpfModuleDefinition, module.moduleId,
+    ))
+  }
 
   const allowedTypes = new Set(definition.containerTypesSystemIds)
   if (container.containerTypeSystemId !== null && !allowedTypes.has(container.containerTypeSystemId)) {
-    throw new ContainerTypeIncompatibleError({
-      moduleSystemId:    module.systemId,
-      containerSystemId: newContainerSystemId,
-      containerTypeSystemId: container.containerTypeSystemId,
-      allowedTypeSystemIds:   [...allowedTypes],
-    })   // → 422 ARC-MOD-CONTAINER-TYPE-INCOMPATIBLE
+    return Result.fail({
+      code:     'ARC-MOD-CONTAINER-TYPE-INCOMPATIBLE',
+      message:  `Container ${newContainerSystemId} type ${container.containerTypeSystemId} is not compatible with module definition. Allowed types: [${[...allowedTypes].join(', ')}]`,
+      severity: IssueSeverity.Error,
+      impactedEntity: {
+        entityType: ISSUE_ENTITY_TYPE.Container,
+        systemId:   newContainerSystemId,
+      },
+    })
   }
 
   await moduleRepo.changeContainer(module.systemId, newContainerSystemId, uow)
+  return Result.ok(undefined)
 }
 ```
 
 ### 11.1.b Port-count changes — algorithm
 
-Symmetric across DataPort input, DataPort output, and ControlPort. Below is the flow for DataPort (INPUT); OUTPUT is identical with a different filter; ControlPort uses the control-link read repo instead of data-link.
+Same Result-based pattern. Below is DataPort (INPUT); OUTPUT is identical with a different filter; ControlPort uses the control-link read repo instead of data-link.
 
 ```ts
 private async applyDataPortCountChange(
@@ -751,40 +767,53 @@ private async applyDataPortCountChange(
   moduleRepo:  IModuleEditRepository,
   uow:         UnitOfWork,
   fileId:      number,
-): Promise<void> {
-  // 1. Enumerate current ports of this ioType on the module.
+): Promise<Result<void>> {
+  // 1. Enumerate current ports of this ioType
   const current = module.dataPorts.filter(p => p.portIoType === ioType)
   const currentCount = current.length
-  if (requested === currentCount) return   // no-op
+  if (requested === currentCount) return Result.ok(undefined)   // no-op
 
-  // 2. Load definition to check the absolute max.
+  // 2. Load definition — check absolute max
   const definition = await defRepo.findByModuleIdAndProcId(module.moduleId, module.procId, fileId)
-  if (!definition) throw new EntityNotFoundException('SpfModuleDefinition', module.moduleId)
+  if (!definition) {
+    return Result.fail(IssueFactory.notFound(
+      ISSUE_ENTITY_TYPE.SpfModuleDefinition, module.moduleId,
+    ))
+  }
   const maxAllowed = ioType === 'INPUT'
     ? definition.maxInputPortsSupported
     : definition.maxOutputPortsSupported
 
   if (requested > maxAllowed) {
-    throw new PortCountExceedsDefinitionError({
-      moduleSystemId: module.systemId, ioType, requested, maxAllowed,
-    })   // → 422 ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION
+    return Result.fail({
+      code:     'ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION',
+      message:  `Requested ${ioType.toLowerCase()} port count ${requested} exceeds module definition limit ${maxAllowed}`,
+      severity: IssueSeverity.Error,
+      impactedEntity: {
+        entityType: ISSUE_ENTITY_TYPE.SpfModule,
+        systemId:   module.systemId,
+      },
+    })
   }
 
   if (requested > currentCount) {
-    // ── ADD ── stage |diff| new DataPorts using definition's port template for this ioType
+    // ── ADD ── stage |diff| new DataPorts using definition's port template
     const diff = requested - currentCount
     const group = definition.dataPortGroups.find(g => g.portIoType === ioType)
-    if (!group) throw new PortCountExceedsDefinitionError({ /* no group → 0 max */ })
+    if (!group) {
+      return Result.fail({
+        code:     'ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION',
+        message:  `Module definition has no ${ioType.toLowerCase()} port group; requested count ${requested} cannot be materialized`,
+        severity: IssueSeverity.Error,
+        impactedEntity: { entityType: ISSUE_ENTITY_TYPE.SpfModule, systemId: module.systemId },
+      })
+    }
 
-    // Naming / natural-ID sourcing:
-    //   Definition may enumerate more static ports than currently present.
-    //   Handler adds ports beyond the currently-materialized ones using the definition's remaining slots.
-    //   Domain question: how is dataPortId assigned for the new ports? — presumed derived from the
-    //   definition's staticPortDefinitions ordering. LLD2 execution phase to confirm exact rule.
+    // OQ-4 (see §17): definition-slot assignment for newly-added ports
     for (let i = 0; i < diff; i++) {
       const port = new DataPort({
         systemId:   this.idGeneration.getNextId(fileId),
-        dataPortId: /* next available id per the definition's slot */ ,
+        dataPortId: /* next unused slot from group.staticPortDefinitions */ ,
         portIoType: ioType,
         isStatic:   true,
         name:       /* per definition */ ,
@@ -792,34 +821,38 @@ private async applyDataPortCountChange(
       await moduleRepo.addDataPort(port, module.systemId, uow)
     }
   } else {
-    // ── REMOVE ── stage |diff| DataPort deletes, unused-only, LIFO by systemId
+    // ── REMOVE ── unused-only, LIFO
     const diff = currentCount - requested
 
-    // 3. Detect which of the current ports are unused (no data-link references).
     const currentIds = current.map(p => p.systemId)
     const links = await linkRead.getLinksByPortSystemIds(currentIds)
     const linkedPortIds = new Set(links.map(l => l.portSystemId))
     const unused = current.filter(p => !linkedPortIds.has(p.systemId))
 
     if (unused.length < diff) {
-      // Not enough unused ports — block with actionable error.
-      const blockedPortSystemIds = current
-        .filter(p => linkedPortIds.has(p.systemId))
-        .map(p => p.systemId)
-      const blockingLinkSystemIds = links
-        .filter(l => blockedPortSystemIds.includes(l.portSystemId))
-        .map(l => l.linkSystemId)
-      throw new PortCountDecreaseBlockedError({
-        moduleSystemId: module.systemId,
-        ioType,
-        requested,
-        currentCount,
-        blockedPortSystemIds,
-        blockingLinkSystemIds,
-      })   // → 422 ARC-MOD-PORT-COUNT-DECREASE-BLOCKED
+      // Emit one Issue per blocked port — each with the blocked port as impactedEntity
+      // and its blocking-link systemIds in the message. Client can act on each issue
+      // individually (delete link → retry PATCH).
+      const blockedPorts = current.filter(p => linkedPortIds.has(p.systemId))
+      const linksByPort = new Map<number, number[]>()
+      for (const l of links) {
+        const arr = linksByPort.get(l.portSystemId) ?? []
+        arr.push(l.linkSystemId)
+        linksByPort.set(l.portSystemId, arr)
+      }
+      const issues = blockedPorts.map(p => ({
+        code:     'ARC-MOD-PORT-COUNT-DECREASE-BLOCKED',
+        message:  `Cannot remove ${ioType.toLowerCase()} port ${p.systemId} — it has ${linksByPort.get(p.systemId)!.length} data-link(s) attached (linkSystemIds: [${linksByPort.get(p.systemId)!.join(', ')}]). Delete the link(s) first.`,
+        severity: IssueSeverity.Error,
+        impactedEntity: {
+          entityType: ISSUE_ENTITY_TYPE.DataPort,   // requires ISSUE_ENTITY_TYPE.DataPort in the enum
+          systemId:   p.systemId,
+        },
+      }))
+      return Result.fail(...issues)
     }
 
-    // 4. LIFO: sort unused by systemId DESC, take |diff|.
+    // LIFO on systemId; take |diff|
     const toRemove = [...unused]
       .sort((a, b) => b.systemId - a.systemId)
       .slice(0, diff)
@@ -828,22 +861,24 @@ private async applyDataPortCountChange(
       await moduleRepo.removeDataPort(p.systemId, module.systemId, uow)
     }
   }
+
+  return Result.ok(undefined)
 }
 ```
 
-`applyControlPortCountChange` mirrors this exactly using `ctrlLinkRead` and `moduleRepo.removeControlPort` / `addControlPort`. ControlPort has no ioType — count applies to all.
+`applyControlPortCountChange` mirrors this with the control-link repo. Emitted issues use `ISSUE_ENTITY_TYPE.ControlPort` for the blocked-port `impactedEntity` — same enum extension.
 
-### 11.1.c Error types
+### 11.1.c Issue codes (structured domain outcomes)
 
-Three domain errors surface as 422 responses via exception filters (defined in `@arc/api`):
+Three domain issue codes emitted via `Result.fail(...)` — no custom Exception classes needed. HTTP status is derived by the existing http-status-map's `ARC-` prefix rule (→ 422 Unprocessable Entity).
 
-| Error class (in `@arc/core`) | Code | HTTP | Body includes |
-|---|---|---|---|
-| `ContainerTypeIncompatibleError` | `ARC-MOD-CONTAINER-TYPE-INCOMPATIBLE` | 422 | moduleSystemId, containerSystemId, containerTypeSystemId, allowedTypeSystemIds |
-| `PortCountExceedsDefinitionError` | `ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION` | 422 | moduleSystemId, ioType, requested, maxAllowed |
-| `PortCountDecreaseBlockedError` | `ARC-MOD-PORT-COUNT-DECREASE-BLOCKED` | 422 | moduleSystemId, ioType, requested, currentCount, blockedPortSystemIds, blockingLinkSystemIds |
+| Code | Meaning | Body fields |
+|---|---|---|
+| `ARC-MOD-CONTAINER-TYPE-INCOMPATIBLE` | Target container's type is not in the module definition's allowed list | `impactedEntity.systemId` = container systemId; `message` includes allowed types |
+| `ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION` | Requested port count exceeds definition's declared max | `impactedEntity.systemId` = module systemId; `message` includes requested + max |
+| `ARC-MOD-PORT-COUNT-DECREASE-BLOCKED` | Cannot decrease port count — one or more ports have data-links / control-links attached | ONE ISSUE PER BLOCKED PORT: `impactedEntity` = the blocked port; `message` lists the blocking link systemIds. Client acts on each independently. |
 
-Registration in the validation-framework's code catalog is a follow-up detail; error classes and exception filters land in this LLD.
+**Vocabulary extension needed:** the core-result-format design's `ISSUE_ENTITY_TYPE` enum (in `packages/core/src/shared/issues/impacted-entity.ts`) currently lists: SpfModule, DataLink, ControlLink, Subgraph, UseCase, Container, SpfModuleDefinition. LLD2 extends this enum with `DataPort` and `ControlPort` so the port-count-decrease-blocked issues can point at specific ports. Small addition, single-file change.
 
 ### 11.2 AddModuleHandler
 
@@ -856,15 +891,18 @@ export class AddModuleCommand extends BaseCommand {
   ]
 
   constructor(
+    clientId:                          string,          // for BaseCommand — request-scoped identifier
     public readonly fileSystemId:      number,
     public readonly moduleId:          number,          // natural module ID (= moduleDefinitionId)
     public readonly procId:            number,          // processor ID
     public readonly parentId:          number | null,   // subsystem parent; null = top-level
     public readonly subgraphSystemId:  number | null,   // null → auto-create (Variant 1)
     public readonly containerSystemId: number | null,   // null → auto-create (Variants 1, 2)
-  ) { super() }
+  ) { super(clientId) }
 }
 ```
+
+The controller constructs `new AddModuleCommand(...)` inline from the request DTO. No `fromPayload` yet — add it (and the matching `FixCommandDispatcher.registerAll()` line) if/when a validation rule surfaces this command as an auto-fix action.
 
 Handler flow:
 
@@ -875,110 +913,136 @@ class AddModuleHandler {
     private readonly naturalIdGeneration: NaturalIdGenerationPort,
   ) {}
 
-  async handle(command: AddModuleCommand, uow: UnitOfWork): Promise<void> {
-    const defRepo       = uow.getModuleDefinitionEditRepository()
-    const subgraphRepo  = uow.getSubgraphEditRepository()
-    const containerRepo = uow.getContainerEditRepository()
-    const subsystemRepo = uow.getSubsystemEditRepository()
-    const moduleRepo    = uow.getModuleEditRepository()
-    const fileId = command.fileSystemId
+  async handle(command: AddModuleCommand, uow: UnitOfWork): Promise<Result<WriteResult>> {
+    await uow.startTransaction()
+    try {
+      const defRepo       = uow.getModuleDefinitionEditRepository()
+      const subgraphRepo  = uow.getSubgraphEditRepository()
+      const containerRepo = uow.getContainerEditRepository()
+      const subsystemRepo = uow.getSubsystemEditRepository()
+      const moduleRepo    = uow.getModuleEditRepository()
+      const fileId = command.fileSystemId
 
-    // 1. Load definition (REQ-ADD-05)
-    const definition = await defRepo.findByModuleIdAndProcId(
-      command.moduleId, command.procId, fileId,
-    )
-    if (!definition) throw new EntityNotFoundException('SpfModuleDefinition', command.moduleId)
-
-    // 1a. Parent subsystem existence check (if parentId provided; not auto-created)
-    if (command.parentId !== null) {
-      if (!await subsystemRepo.subsystemExists(command.parentId, fileId))
-        throw new EntityNotFoundException('Subsystem', command.parentId)
-    }
-
-    // 2. Subgraph (Variant 1 = auto-create; otherwise validate)
-    let subgraphSystemId: number
-    if (command.subgraphSystemId === null) {
-      subgraphSystemId    = this.idGeneration.getNextId(fileId)
-      const subgraphId    = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.SUBGRAPH)
-      const subgraph = new Subgraph({
-        systemId:     subgraphSystemId,
-        subgraphId,                                // natural ID via NaturalIdGenerationPort
-        name:         `SG_${subgraphId}`,           // REQ-ADD-02 default name
-        isExported:   false,
-        fileSystemId: fileId,
-      })
-      await subgraphRepo.createSubgraph(subgraph, uow)
-      // TODO(OQ-1): subgraphRepo.createSubgraphPropertyDefaults(subgraphSystemId, uow)
-    } else {
-      subgraphSystemId = command.subgraphSystemId
-      if (!await subgraphRepo.subgraphExists(subgraphSystemId, fileId))
-        throw new EntityNotFoundException('Subgraph', subgraphSystemId)
-    }
-
-    // 3. Container (Variants 1 & 2 = auto-create; Variant 3 validates)
-    let containerSystemId: number
-    if (command.containerSystemId === null) {
-      const containerTypeSystemId = [...definition.containerTypesSystemIds][0] ?? null   // REQ-ADD-03
-      containerSystemId  = this.idGeneration.getNextId(fileId)
-      const containerId  = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.CONTAINER)
-      const container = new Container(
-        containerSystemId,       // systemId
-        containerId,             // natural ID via NaturalIdGenerationPort
-        containerTypeSystemId,
-        fileId,
+      // 1. Load definition (REQ-ADD-05)
+      const definition = await defRepo.findByModuleIdAndProcId(
+        command.moduleId, command.procId, fileId,
       )
-      await containerRepo.createContainer(container, uow)
-      // TODO(OQ-1): containerRepo.createContainerPropertyDefaults(containerSystemId, uow)
-    } else {
-      containerSystemId = command.containerSystemId
-      if (!await containerRepo.containerExists(containerSystemId, fileId))
-        throw new EntityNotFoundException('Container', containerSystemId)
+      if (!definition) {
+        await uow.rollback()
+        return Result.fail(IssueFactory.notFound(
+          ISSUE_ENTITY_TYPE.SpfModuleDefinition, command.moduleId,
+        ))
+      }
+
+      // 1a. Parent subsystem existence check (if parentId provided; not auto-created)
+      if (command.parentId !== null) {
+        if (!await subsystemRepo.subsystemExists(command.parentId, fileId)) {
+          await uow.rollback()
+          return Result.fail(IssueFactory.notFound(
+            ISSUE_ENTITY_TYPE.Subsystem, command.parentId,      // requires Subsystem in ISSUE_ENTITY_TYPE
+          ))
+        }
+      }
+
+      // 2. Subgraph (Variant 1 = auto-create; otherwise validate)
+      let subgraphSystemId: number
+      if (command.subgraphSystemId === null) {
+        subgraphSystemId    = this.idGeneration.getNextId(fileId)
+        const subgraphId    = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.SUBGRAPH)
+        const subgraph = new Subgraph({
+          systemId:     subgraphSystemId,
+          subgraphId,                                // natural ID via NaturalIdGenerationPort
+          name:         `SG_${subgraphId}`,           // REQ-ADD-02 default name
+          isExported:   false,
+          fileSystemId: fileId,
+        })
+        await subgraphRepo.createSubgraph(subgraph, uow)
+        // TODO(OQ-1): subgraphRepo.createSubgraphPropertyDefaults(subgraphSystemId, uow)
+      } else {
+        subgraphSystemId = command.subgraphSystemId
+        if (!await subgraphRepo.subgraphExists(subgraphSystemId, fileId)) {
+          await uow.rollback()
+          return Result.fail(IssueFactory.notFound(
+            ISSUE_ENTITY_TYPE.Subgraph, subgraphSystemId,
+          ))
+        }
+      }
+
+      // 3. Container (Variants 1 & 2 = auto-create; Variant 3 validates)
+      let containerSystemId: number
+      if (command.containerSystemId === null) {
+        const containerTypeSystemId = [...definition.containerTypesSystemIds][0] ?? null   // REQ-ADD-03
+        containerSystemId  = this.idGeneration.getNextId(fileId)
+        const containerId  = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.CONTAINER)
+        const container = new Container(
+          containerSystemId,       // systemId
+          containerId,             // natural ID via NaturalIdGenerationPort
+          containerTypeSystemId,
+          fileId,
+        )
+        await containerRepo.createContainer(container, uow)
+        // TODO(OQ-1): containerRepo.createContainerPropertyDefaults(containerSystemId, uow)
+      } else {
+        containerSystemId = command.containerSystemId
+        if (!await containerRepo.containerExists(containerSystemId, fileId)) {
+          await uow.rollback()
+          return Result.fail(IssueFactory.notFound(
+            ISSUE_ENTITY_TYPE.Container, containerSystemId,
+          ))
+        }
+      }
+
+      // 4. Materialize static ports from definition (REQ-ADD-06)
+      // Port natural IDs (dataPortId, portId) come from the DEFINITION, not from
+      // NaturalIdGenerationPort — they are definition-scoped identifiers.
+      const dataPorts: DataPort[] = definition.dataPortGroups.flatMap(group =>
+        group.staticPortDefinitions.map(def => new DataPort({
+          systemId:   this.idGeneration.getNextId(fileId),
+          dataPortId: def.dataPortId,                // ← from definition
+          portIoType: group.portIoType,
+          isStatic:   true,
+          name:       def.name,
+        })),
+      )
+
+      // 5. Module: allocate systemId + natural instanceId, build the aggregate
+      const moduleSystemId = this.idGeneration.getNextId(fileId)
+      const instanceId     = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.MODINSTANCE)
+
+      const controlPorts: ControlPort[] = definition.staticControlPorts.map(def =>
+        new ControlPort({
+          systemId:        this.idGeneration.getNextId(fileId),
+          portId:          def.portId,               // ← from definition
+          isStatic:        true,
+          nodeSystemId:    moduleSystemId,
+          name:            def.portName,
+          intentSystemIds: [],
+        }),
+      )
+
+      const module = new SpfModule({
+        systemId:           moduleSystemId,
+        instanceId,                                   // natural ID via NaturalIdGenerationPort
+        definitionSystemId: definition.systemId,
+        containerSystemId,
+        subgraphSystemId,
+        fileSystemId:       fileId,
+        parentSystemId:     command.parentId ?? undefined,
+        dataPorts,
+        controlPorts,
+      })
+
+      await moduleRepo.createModule(module, uow)
+
+      // 6. All edit_actions rows across steps 2-5 share the same groupId via WriteContext
+      //    → single-undo-step atomicity (REQ-ADD-07)
+
+      await uow.commit()
+      return Result.ok({ groupId: uow.getWriteContext().groupId })
+    } catch (err) {
+      await uow.rollback()
+      throw err
     }
-
-    // 4. Materialize static ports from definition (REQ-ADD-06)
-    // Port natural IDs (dataPortId, portId) come from the DEFINITION, not from
-    // NaturalIdGenerationPort — they are definition-scoped identifiers.
-    const dataPorts: DataPort[] = definition.dataPortGroups.flatMap(group =>
-      group.staticPortDefinitions.map(def => new DataPort({
-        systemId:   this.idGeneration.getNextId(fileId),
-        dataPortId: def.dataPortId,                // ← from definition
-        portIoType: group.portIoType,
-        isStatic:   true,
-        name:       def.name,
-      })),
-    )
-
-    // 5. Module: allocate systemId + natural instanceId, build the aggregate
-    const moduleSystemId = this.idGeneration.getNextId(fileId)
-    const instanceId     = this.naturalIdGeneration.getNextId(fileId, NaturalIdType.MODINSTANCE)
-
-    const controlPorts: ControlPort[] = definition.staticControlPorts.map(def =>
-      new ControlPort({
-        systemId:        this.idGeneration.getNextId(fileId),
-        portId:          def.portId,               // ← from definition
-        isStatic:        true,
-        nodeSystemId:    moduleSystemId,
-        name:            def.portName,
-        intentSystemIds: [],
-      }),
-    )
-
-    const module = new SpfModule({
-      systemId:           moduleSystemId,
-      instanceId,                                   // natural ID via NaturalIdGenerationPort
-      definitionSystemId: definition.systemId,
-      containerSystemId,
-      subgraphSystemId,
-      fileSystemId:       fileId,
-      parentSystemId:     command.parentId ?? undefined,
-      dataPorts,
-      controlPorts,
-    })
-
-    await moduleRepo.createModule(module, uow)
-
-    // 6. All edit_actions rows across steps 2-5 share the same groupId via WriteContext
-    //    → single-undo-step atomicity (REQ-ADD-07)
   }
 }
 ```
@@ -996,55 +1060,64 @@ class AddModuleHandler {
 
 ## 12. Existence & Domain Validation
 
-**Existence checks (404):**
-- `PatchSpfModuleHandler` — validates target module exists via `moduleRepo.findModuleForPatch` (REQ-VAL-01). Additionally validates container (if `containerSystemId` is present) via `containerRepo.getContainerById`. Module definition lookup fails → 404 as well.
-- `AddModuleHandler` — validates definition, provided `subgraphSystemId` / `containerSystemId` (REQ-VAL-02), and provided `parentId` (subsystem — §8a).
-- Missing entity → typed domain exception → 404 at api layer. Errors surface before any staging.
+Per the core-result-format design, LLD2 handlers express **structured failures via `Result.fail(...)`** with issue codes and `impactedEntity`. Only truly exceptional failures (DB errors, framework bugs) throw exceptions (caught by `AllExceptionsFilter` → 500). No custom Exception classes for domain violations.
 
-**Domain-rule violations (422):**
-- PATCH `containerSystemId` — target container's `containerTypeSystemId` must be in the module definition's `containerTypesSystemIds` allowed list. Else `ContainerTypeIncompatibleError`.
-- PATCH `numberOf{Input,Output,Control}Ports` — requested count must not exceed the definition's declared max for that kind. Else `PortCountExceedsDefinitionError`.
-- PATCH port-count decrease — enough unused ports must exist to satisfy the delta. Else `PortCountDecreaseBlockedError` with `blockedPortSystemIds` + `blockingLinkSystemIds` for actionable UX.
+**Existence checks — return `Result.fail(IssueFactory.notFound(...))` with 404 mapping via `resolveHttpStatus('ENTITY_NOT_FOUND')` → 404:**
+- `PatchSpfModuleHandler` — target module (via `findModuleForPatch`), plus target container (when `containerSystemId` present) and module definition.
+- `AddModuleHandler` — definition, provided `subgraphSystemId` / `containerSystemId` (REQ-VAL-02), provided `parentId` (subsystem — §8a).
 
-All checks run before staging any writes. Order within the handler: existence first, then domain rules, then writes.
+**Domain-rule violations — return `Result.fail({code, message, severity, impactedEntity})` with 422 mapping via the `ARC-` prefix rule in `resolveHttpStatus`:**
+- `ARC-MOD-CONTAINER-TYPE-INCOMPATIBLE` — target container's type not in the module definition's allowed list.
+- `ARC-MOD-PORT-COUNT-EXCEEDS-DEFINITION` — requested port count > definition max.
+- `ARC-MOD-PORT-COUNT-DECREASE-BLOCKED` — one issue per blocked port (has attached data-link / control-link).
+
+**Session gating (403) is handled upstream — not the handler's concern:**
+- `SESSION_NOT_OPEN` (SessionGuard) → 403 exception.
+- `SESSION_MODE_NOT_ALLOWED` (CommandBus mode check per LLD1) → 403 exception.
+
+All checks run before any staging. Order within the handler: existence → domain rules → writes. `Result.fail` short-circuits — no partial writes escape.
 
 ---
 
-## 12a. Write API Response Shape
+## 12a. Handler and API Response Shape
 
-Every write handler in LLD2 returns a uniform `WriteResult`:
+**Handler contract** (per core-result-format design):
 
 ```ts
 type WriteResult = {
-  groupId:   string       // atomic handle for undo/redo/stage/unstage of the whole call
-  changeIds: number[]     // per-row handles
+  groupId: string       // atomic handle for undo/redo/stage/unstage of the whole call
 }
+
+// Both PatchSpfModuleHandler and AddModuleHandler:
+//   Promise<Result<WriteResult>>
 ```
 
-Both `PatchSpfModuleHandler` and `AddModuleHandler` return this shape. No handler-specific extensions.
+- `Result.ok({groupId})` on success. Callers that need row-level detail (individual `change_id`s) can query `edit_actions WHERE group_id = ?` — the atomic-unit handle is the useful boundary; row enumeration is a follow-up concern.
+- `Result.fail(...issues)` on structured failure (existence, domain rule violations).
+- `throw` only for exceptional infrastructure failures (caught by `AllExceptionsFilter` → 500).
 
-### HTTP response shape (returned by controller)
-
-The API contract (matching PR #90 + existing swagger) returns the full effective `SpfModuleDto` on both PATCH and POST. **Handlers do NOT construct this DTO.** Controller composes the response via a follow-up read after the write command succeeds:
+**Controller pattern** — dispatch write via CommandBus, then invoke query for the response DTO:
 
 ```ts
-// Controller pattern (illustrative — actual code in @arc/api)
-async patchModule(params, body, session): Promise<ApiResult<SpfModuleDto>> {
+async patchModule(params, body, @Req request): Promise<ApiResult<SpfModuleDto>> {
   const cmd = new PatchSpfModuleCommand(...)
-  await this.commandBus.execute(cmd, session)                   // stages edit_actions
-  const module = await this.spfModuleQueryService.findOne(     // reads effective state
-    params.spfModuleSystemId, session.fileSystemId,
+  const writeResult = await this.commandBus.execute(cmd, request.arcSession)
+  throwIfFailed(writeResult)                                          // core-result-format helper
+
+  // Follow-up read for the response body
+  const readResult = await this.spfModuleQueryService.findOne(
+    params.spfModuleSystemId, request.arcSession.fileSystemId,
   )
-  return ApiResult.ok(module)
+  throwIfFailed(readResult)
+  return toApiResult(readResult)                                      // core-result-format helper
 }
 ```
 
 **Why controller composes reads + writes:**
 
-- Preserves CQRS separation — command handlers stage edits, query services return effective state. Neither has to know about the other's concerns.
+- Preserves CQRS separation — command handlers stage edits, query services return effective state.
 - LLD2 (writes) stays independently buildable/testable — no dependency on LLD3 (reads) landing first.
-- Handler tests never need read-service stubs; controller tests can mock both.
-- The just-written pending change is visible to the follow-up read because the read overlay includes `edit_actions` rows with `validUntil IS NULL`. Same-transaction is not required; per-session single-writer (I1) guarantees no interleaving between the write and the read.
+- Read overlay includes the just-written `edit_actions` row (`validUntil IS NULL` filter). Single-active-session invariant (I1) guarantees no interleaving.
 
 For AddModule, allocated systemIds (module, subgraph, container, ports) surface naturally in the returned `SpfModuleDto` — no separate `allocatedSystemIds` envelope needed.
 
@@ -1106,7 +1179,7 @@ Full folder tree — files created or modified:
 - `.../repositories/control-link/control-link-read.repository.ts` — new port (link-read, §6a).
 - `packages/core/src/application/module/patch/*.ts` — `PatchSpfModuleCommand` + `PatchSpfModuleHandler`.
 - `packages/core/src/application/module/add-module/*.ts` — `AddModuleCommand` + `AddModuleHandler`.
-- `packages/core/src/application/errors/module-errors.ts` — new domain errors: `ContainerTypeIncompatibleError`, `PortCountExceedsDefinitionError`, `PortCountDecreaseBlockedError`.
+- `packages/core/src/shared/issues/impacted-entity.ts` — extend `ISSUE_ENTITY_TYPE` enum with `DataPort`, `ControlPort`, and `Subsystem` values (needed for existence-check and port-count-decrease `impactedEntity` values). Single-file additive change.
 - `packages/core/src/application/ports/persistence/unit-of-work.ts` — extend with new accessors.
 - `packages/infrastructure/persistence/src/persistence-typeorm-sqllite/repositories/module/module-edit.repository.ts` — new adapter.
 - `.../repositories/subgraph/subgraph-edit.repository.ts` — new adapter.
@@ -1117,8 +1190,7 @@ Full folder tree — files created or modified:
 - `.../repositories/control-link/control-link-read.repository.ts` — new adapter.
 - `.../unit-of-work/typeorm-unit-of-work.ts` — extend to expose new accessors.
 - `packages/core/src/application/orchestration/cqrs/registries/command-handler-registry.ts` — register `PatchSpfModuleHandler` and `AddModuleHandler` via factories.
-- `packages/api/src/filters/*.filter.ts` — exception filters mapping `ContainerTypeIncompatibleError`, `PortCountExceedsDefinitionError`, `PortCountDecreaseBlockedError` to 422 with structured body.
-- API controller wiring — `PATCH /spf-modules/:id` and `POST /spf-modules` methods in `SpfModuleController`. Handler-side spec is in this LLD; controller-side implementation follows the codebase's NestJS conventions.
+- API controller wiring — `PATCH /spf-modules/:id` and `POST /spf-modules` methods in `SpfModuleController` — call `commandBus.execute()`, use `throwIfFailed()` + follow-up query + `toApiResult()` per the core-result-format design's controller pattern. No custom exception filters needed for LLD2 domain errors — the `ARC-` prefix rule in `http-status-map.ts` already maps them to 422.
 
 ---
 
@@ -1157,7 +1229,15 @@ Full folder tree — files created or modified:
 - No schema changes in this LLD (LLD1 owns them).
 - Existing `SpfModuleQueryHandler` (query-spf-modules.handler.ts) is not touched by LLD2 — reads are LLD3's concern. LLD2's PATCH/AddModule controllers invoke the existing read service for the response — it works with the current overlay implementation; LLD3 will rewrite that overlay in place.
 - PR #90 (colleague's API-layer PR) adds `PATCH /spf-modules/:id` and related endpoints as stubs throwing `NotImplementedException`. LLD2 replaces those stubs with real dispatches to `PatchSpfModuleCommand` / `AddModuleCommand`. Note: PR #90's `PatchSpfModuleRequestDto` field names (`maxInputPortsSupported` etc.) will need renaming to `numberOfInputPorts` / `numberOfOutputPorts` / `numberOfControlPorts` to match LLD2 semantics — coordinate before LLD2 execution begins.
+- **Core-result-format PR** (`docs/core-result-format/design/core-result-format-design.md`) must land before LLD2. LLD2 depends on: `Result<T>` type, `Issue` interface, `IssueFactory`, `ISSUE_ENTITY_TYPE` enum, `throwIfFailed()`, `resolveHttpStatus()`, `ApiResult<T>` DTO, `ApiIssueItem` DTO. Rebase LLD2's execution branch onto post-core-result-format `main` before beginning.
 - LLD1 must land before LLD2 execution starts (schema + `PendingChangeWriter` + `SessionGuard` + `CommandBus` mode check are LLD2 dependencies).
+- **Delete the existing `CreateModuleCommand` stub** that is re-exported as `AddModuleCommand` from `packages/core/src/application/usecase-designer/index.ts`. Concretely:
+  - Delete the old command class file (`create-module.command.ts` or equivalent) under `packages/core/src/application/usecase-designer/`.
+  - Delete its handler class + file.
+  - Remove its entry from `CommandHandlerRegistry`.
+  - Remove the `AddModuleCommand` re-export line from `packages/core/src/application/usecase-designer/index.ts`.
+  - Delete any test file(s) that exclusively cover the old stub.
+  - Verify no other imports reference the old symbol; the new `AddModuleCommand` lives at `packages/core/src/application/module/add-module/` (§11.2).
 
 ---
 
@@ -1165,7 +1245,7 @@ Full folder tree — files created or modified:
 
 - **OQ-1 — Property-data defaults on auto-create** (§10). Deferred to a follow-up. Needs read ports for subgraph and container property definitions plus a domain-shaped defaulting policy.
 - **OQ-2 — Container type resolution for DIFF_MERGE AddModule** — REQ-ADD-03 says "first entry" from the definition. If the diff-tool wants to specify a different container type, would need an extension. Not blocking for Phase 1.
-- **OQ-3 — Write-handler error style: `Result<T>` vs exceptions.** Read handlers in the current codebase (e.g., `SpfModuleQueryHandler`) return `Result<T>`. LLD2's write handlers throw. Recommendation: keep writes on exceptions (simpler; failures are exceptional; commit failures already use `ValidationReport` for user-actionable errors). Reads on `Result<T>` for the read-may-return-partial-success case. Confirm during LLD2 execution.
+- **OQ-3 — Write-handler error style: `Result<T>` vs exceptions — RESOLVED.** The core-result-format design (`docs/core-result-format/design/core-result-format-design.md`) settles this: handlers return `Result<T>` for structured outcomes (both success and structured failure); throw exceptions only for exceptional/infrastructure failures. LLD2 handlers return `Promise<Result<WriteResult>>`. Domain violations use `Result.fail({code: 'ARC-MOD-*', ...})`. Existence failures use `Result.fail(IssueFactory.notFound(...))`. Session-mode/session-not-open remain exceptions (thrown upstream by CommandBus/SessionGuard per LLD1).
 - **OQ-4 — Definition slot assignment for PATCH port-count increase.** When PATCH increases `numberOfInputPorts` from 2 to 5, the handler stages 3 new DataPort CREATEs. Which `dataPortId` (natural ID from the definition's `staticPortDefinitions[]`) and `name` do the new ports use? Assumed: definition-slot-order — take the next unused slot from `staticPortDefinitions[]`. If definitions declare only up to `numberOfCurrentPorts` and no more slots exist, the operation should error (impossible if `maxInputPortsSupported ≥ requested`, but worth confirming). LLD2 execution phase must confirm the exact slot-assignment rule.
 
 ---
