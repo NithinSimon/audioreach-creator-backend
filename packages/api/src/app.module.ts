@@ -23,13 +23,20 @@ import {PropertyDefinitionModule} from './presentation/rest/modules/definition/p
 import {ModuleDefinitionModule} from './presentation/rest/modules/definition/module-definition/module-definition.module.js';
 import {SpfCustomModuleSchemaModule} from './presentation/rest/modules/definition/spf-custom-module-schema/spf-custom-module-schema.module.js';
 import {RequestLoggerMiddleware} from './infrastructure-wrapper/middleware/request-logger.middleware.js';
+import {RuntimeModule} from './infrastructure-wrapper/runtime/runtime.module.js';
+import {ReadinessMiddleware} from './infrastructure-wrapper/runtime/readiness.middleware.js';
+import {RuntimeInitializerService} from './infrastructure-wrapper/runtime/runtime-initializer.service.js';
+import {RuntimeShutdownService} from './infrastructure-wrapper/runtime/runtime-shutdown.service.js';
+import {HealthModule} from './presentation/rest/modules/health/health.module.js';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    RuntimeModule,
     ArcCqrsModule,
+    HealthModule,
     AuthenticationModule,
     ProjectModule,
     KeyDefinitionModule,
@@ -48,10 +55,16 @@ import {RequestLoggerMiddleware} from './infrastructure-wrapper/middleware/reque
   ],
 
   controllers: [],
-  providers: [],
+  providers: [
+    RuntimeInitializerService,
+    RuntimeShutdownService,
+    ReadinessMiddleware,
+  ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(RequestLoggerMiddleware).forRoutes('*');
+    consumer
+      .apply(ReadinessMiddleware, RequestLoggerMiddleware)
+      .forRoutes('*');
   }
 }

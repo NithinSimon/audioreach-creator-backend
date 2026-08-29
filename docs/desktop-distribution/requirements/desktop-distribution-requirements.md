@@ -31,8 +31,8 @@ contract.
 ### 1.3 Decisions already made
 
 - The first customer release is a local, single-user desktop product, not a network server.
-- The product starts the backend after the installing user logs in; it does not need to run before
-  login or as a machine-wide system service.
+- The product starts a per-user backend runtime host after the installing user logs in; it does not
+  need to run before login or as a machine-wide system service.
 - Electron may start an unavailable backend and wait for it to become ready, but must never stop it
   when its own window closes.
 - Updates are downloaded and installed by rerunning a signed installer. In-product auto-updates are
@@ -56,10 +56,11 @@ contract.
 
 #### FR-DD-01: Single signed customer installation
 
-For each supported operating system, the product shall provide a signed installer wizard that
-installs a compatible Electron frontend and backend together. The installer shall bundle the
-required Node.js 22 runtime and backend production dependencies, so customers do not need to
-install Node.js, pnpm, build tools, or backend dependencies.
+For each supported operating system, the product shall provide a signed, guided platform-native
+installation that installs a compatible Electron frontend and backend together. Windows shall use
+an installation wizard; macOS and Linux shall use their supported platform-native install flows.
+The distribution shall bundle the required Node.js 22 runtime and backend production dependencies,
+so customers do not need to install Node.js, pnpm, build tools, or backend dependencies.
 
 If the installer cannot verify its package integrity or signature, it shall abort before installing
 or replacing application binaries and explain the failure.
@@ -96,14 +97,28 @@ terminate the backend as part of its own exit path.
 If a second backend start is requested for the same user, the product shall detect the active
 instance and use it rather than create a competing instance and SQLite writer.
 
-#### FR-DD-05: Client-assisted availability
+#### FR-DD-05: Local service supervision and recovery
+
+The product shall run an independent, per-user runtime host after user login. The runtime host shall
+manage explicitly declared local services. Each service definition shall identify its launch command,
+readiness health check, restart policy, dependencies, and diagnostic-log destination.
+
+The first-release service manifest shall contain only the offline Backend API. The runtime host shall
+start it, detect its process exit, poll its local readiness health check, and restart it after a
+crash or sustained non-ready state. It shall use bounded restart backoff and record diagnostics for
+repeated failures.
+
+The operating system's per-user startup facility shall restart the runtime host if the runtime host
+itself exits unexpectedly. No client may be the primary owner of backend recovery.
+
+#### FR-DD-06: Client-assisted availability
 
 The Electron client shall determine whether the backend is available before using the API. If it is
 not available, Electron may request its startup, wait for readiness, and show a clear recoverable
 error when it cannot become ready. This behavior shall not make Electron the owner of backend
 shutdown or ongoing process lifetime.
 
-#### FR-DD-06: Local-only network binding
+#### FR-DD-07: Local-only network binding
 
 The backend shall bind exclusively to loopback interfaces (`127.0.0.1` and, where supported,
 `::1`). It shall not accept API connections from other computers on the LAN or any other network.
@@ -111,7 +126,7 @@ The backend shall bind exclusively to loopback interfaces (`127.0.0.1` and, wher
 If the configured bind address is not loopback, the backend shall refuse to start and report a
 safe configuration error.
 
-#### FR-DD-07: Port selection and endpoint discovery
+#### FR-DD-08: Port selection and endpoint discovery
 
 On first installation or when no usable endpoint configuration exists, the local backend shall
 select an available loopback port. It shall publish its active API base address to a well-known
@@ -127,7 +142,7 @@ first release.
 
 ### 3.3 Data, readiness, and observability
 
-#### FR-DD-08: Per-user mutable data
+#### FR-DD-09: Per-user mutable data
 
 The SQLite database, endpoint discovery record, user configuration, imported-file state, and logs
 shall be stored in the per-user data directory, not alongside installed binaries. The backend shall
@@ -136,7 +151,7 @@ create the required parent directories before opening SQLite.
 The database location shall retain its current OS-specific default and become configurable through
 the backend configuration mechanism.
 
-#### FR-DD-09: Readiness health check
+#### FR-DD-10: Readiness health check
 
 The backend shall expose a local health/readiness check. It shall report ready only after the HTTP
 server is accepting requests, database initialization is complete, all pending migrations have
@@ -145,14 +160,14 @@ completed, and the shared workspace state is safe for clients to use.
 Before readiness, the check shall report an explicit non-ready state. Startup failure, migration
 failure, or an inaccessible data directory shall result in a non-ready state and diagnostic logs.
 
-#### FR-DD-10: Diagnostics
+#### FR-DD-11: Diagnostics
 
 The backend shall retain startup, health, and crash diagnostics in the per-user data directory.
 The Electron application shall provide a way to reveal or export those logs for customer support.
 
 ### 3.4 Upgrade and removal
 
-#### FR-DD-11: Installer-driven upgrade
+#### FR-DD-12: Installer-driven upgrade
 
 Customers shall upgrade by downloading and rerunning a signed installer. An upgrade shall replace
 the installed frontend and backend binaries while preserving per-user database, imported-file state,
@@ -162,7 +177,7 @@ before reporting ready.
 If an upgrade cannot preserve or migrate user data safely, it shall stop and report the problem
 without deleting that data.
 
-#### FR-DD-12: Intentional data removal
+#### FR-DD-13: Intentional data removal
 
 Uninstall shall preserve per-user application data by default. It shall offer an explicit, clearly
 labeled option to delete all AudioReach Creator user data. Selecting that option shall remove the
@@ -170,7 +185,7 @@ database, imported-file state, configuration, discovery record, and logs for tha
 
 ### 3.5 Frontend/backend independence
 
-#### FR-DD-13: Remote-ready client boundary
+#### FR-DD-14: Remote-ready client boundary
 
 Electron's API connection logic shall be separate from its local-backend availability logic. Local
 mode shall use the discovery record and may start the local backend; a future remote-server mode
@@ -210,6 +225,10 @@ line, developer tools, or separate Node.js installation.
 **NFR-DD-04 - Backward-compatible deployment boundary:** Distribution, OS startup, and HTTP health
 concerns remain in the API/desktop-adapter layers. `@arc/core` remains framework- and Node-free.
 
+**NFR-DD-05 - Multi-service evolution:** The runtime host is extensible through declared local-service
+definitions so future device or real-time Node.js services can be supervised without changing the
+first-release Backend API's process contract.
+
 ## 6. Out of Scope
 
 - A remotely reachable, multi-user server deployment.
@@ -218,6 +237,8 @@ concerns remain in the API/desktop-adapter layers. `@arc/core` remains framework
 - In-product automatic download and installation of updates.
 - Native Windows arm64 artifacts; Windows-on-ARM uses x64 emulation initially.
 - Certification for Linux distributions other than the specified Ubuntu LTS releases.
+- Implementation of future real-time device tuning or monitoring services. The first release only
+  reserves the runtime host extension point for such services.
 - Changing domain/CQRS behavior beyond the small API/bootstrap configuration and health needs of this
   distribution scope.
 

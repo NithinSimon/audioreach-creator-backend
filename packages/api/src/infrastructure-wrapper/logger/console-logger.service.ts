@@ -7,30 +7,26 @@ import {Injectable, type OnModuleDestroy} from '@nestjs/common';
 import {type Logger, type LogData, LogLevel} from '@arc/core';
 import * as fs from 'node:fs';
 import path from 'node:path';
-import * as os from 'node:os';
+import {RuntimePaths} from '../runtime/runtime-paths.js';
 
 @Injectable()
 export class ConsoleLoggerService implements Logger, OnModuleDestroy {
-  private logFilePath: string;
+  private readonly filePath: string;
   private logStream: fs.WriteStream;
 
-  constructor() {
-    // Create logs directory in the project root
-    const logsDir = path.join(process.cwd(), 'logs');
-    if (!fs.existsSync(logsDir)) {
-      fs.mkdirSync(logsDir, {recursive: true});
+  constructor(runtimePaths: RuntimePaths) {
+    if (!fs.existsSync(runtimePaths.logsDir)) {
+      fs.mkdirSync(runtimePaths.logsDir, {recursive: true});
     }
 
-    // Create log file with timestamp
-    const timestamp = new Date().toISOString().replaceAll(':', '-');
-    this.logFilePath = path.join(logsDir, `server-debug-${timestamp}.log`);
-    this.logStream = fs.createWriteStream(this.logFilePath, {flags: 'a'});
+    this.filePath = path.join(runtimePaths.logsDir, 'api.jsonl');
+    this.logStream = fs.createWriteStream(this.filePath, {flags: 'a'});
 
     // Log startup information
     this.logInfo({
       component: 'Logger',
       action: 'initialize',
-      msg: `Logger initialized. Writing to ${this.logFilePath}`,
+      msg: `Logger initialized. Writing to ${this.filePath}`,
       timestamp: new Date(),
       tag: 'startup',
     });
@@ -42,6 +38,10 @@ export class ConsoleLoggerService implements Logger, OnModuleDestroy {
         resolve();
       });
     });
+  }
+
+  logFilePath(): string {
+    return this.filePath;
   }
 
   logVerbose(data: LogData): void {
@@ -72,7 +72,7 @@ export class ConsoleLoggerService implements Logger, OnModuleDestroy {
     const logEntry = this.formatLogEntry(level, data);
 
     // Write to file
-    this.logStream.write(logEntry + os.EOL);
+    this.logStream.write(`${logEntry}\n`);
 
     // Also log to console
     switch (level) {
@@ -91,38 +91,30 @@ export class ConsoleLoggerService implements Logger, OnModuleDestroy {
         console.error(logEntry);
         if (data.error) {
           console.error(data.error);
-          // Also write error stack to file
-          if (data.error.stack) {
-            this.logStream.write(`STACK: ${data.error.stack}${os.EOL}`);
-          }
         }
         break;
     }
   }
 
   private formatLogEntry(level: LogLevel, data: LogData): string {
-    const timestamp = data.timestamp.toISOString();
-    const parts = [
-      `[${timestamp}]`,
-      `[${level.toUpperCase()}]`,
-      `[${data.component}]`,
-      `[${data.action}]`,
-    ];
-
-    if (data.tag) {
-      parts.push(`[${data.tag}]`);
-    }
-
-    if (data.clientId) {
-      parts.push(`[Client: ${data.clientId}]`);
-    }
-
-    if (data.projectId) {
-      parts.push(`[Project: ${data.projectId}]`);
-    }
-
-    parts.push(data.msg);
-
-    return parts.join(' ');
+    return JSON.stringify({
+      level,
+      msg: data.msg,
+      action: data.action,
+      component: data.component,
+      tag: data.tag,
+      timestamp: data.timestamp.toISOString(),
+      ...(data.clientId ? {clientId: data.clientId} : {}),
+      ...(data.projectId ? {projectId: data.projectId} : {}),
+      ...(data.error
+        ? {
+            error: {
+              name: data.error.name,
+              message: data.error.message,
+              stack: data.error.stack,
+            },
+          }
+        : {}),
+    });
   }
 }

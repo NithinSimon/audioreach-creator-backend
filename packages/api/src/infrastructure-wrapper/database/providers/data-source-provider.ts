@@ -6,23 +6,20 @@
 import {getOrmBase} from '@arc/persistence';
 import type {Logger, LogData} from '@arc/core';
 import {Injectable, Inject} from '@nestjs/common';
-import type {OnModuleInit, OnModuleDestroy} from '@nestjs/common';
-import {getDatabasePath} from '../database-path.js';
+import type {OnModuleDestroy} from '@nestjs/common';
 import {NodeBlobBytesConverter} from '../node-blob-converter.js';
 import {DataSource} from 'typeorm';
+import {RuntimePaths} from '../../runtime/runtime-paths.js';
 
 @Injectable()
-export class DataSourceProvider implements OnModuleInit, OnModuleDestroy {
+export class DataSourceProvider implements OnModuleDestroy {
   private static instance: DataSource | null = null;
 
   constructor(
     /*private configService: ConfigService,*/
     @Inject('LOGGER') private logger: Logger,
+    private readonly runtimePaths: RuntimePaths,
   ) {}
-
-  async onModuleInit() {
-    await this.getDataSource();
-  }
 
   async getDataSource(): Promise<DataSource> {
     if (DataSourceProvider.instance) {
@@ -47,7 +44,7 @@ export class DataSourceProvider implements OnModuleInit, OnModuleDestroy {
 
     return new DataSource({
       type: 'sqlite',
-      database: getDatabasePath(/*this.configService*/),
+      database: this.runtimePaths.databasePath,
       ...base,
       extra: {
         connectionLimit: 10,
@@ -79,6 +76,10 @@ export class DataSourceProvider implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
+    await this.destroy();
+  }
+
+  async destroy(): Promise<void> {
     if (DataSourceProvider.instance) {
       this.logInfo('Closing DataSource connection...');
       await DataSourceProvider.instance.destroy();

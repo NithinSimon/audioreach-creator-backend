@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "services": [
+    {
+      "id": "offline-api",
+      "command": "../node/node",
+      "arguments": ["../app/node_modules/@arc/api/dist/main.js"],
+      "readinessPath": "/health/ready",
+      "dependsOn": []
+    }
+  ]
+}

@@ -38,8 +38,10 @@ import {
 } from '@arc/fs';
 import {ConsoleLoggerService} from './logger/index.js';
 import {SessionGuard} from '../guards/session-guard.js';
+import {RuntimeModule} from './runtime/runtime.module.js';
 
 @Module({
+  imports: [RuntimeModule],
   providers: [
     DataSourceProvider,
     {
@@ -184,6 +186,7 @@ import {SessionGuard} from '../guards/session-guard.js';
     },
   ],
   exports: [
+    DataSourceProvider,
     CommandBus,
     QueryBus,
     FixCommandDispatcher,

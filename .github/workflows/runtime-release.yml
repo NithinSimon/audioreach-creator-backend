@@ -1,0 +1,67 @@
+name: Backend Runtime Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['runtime-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build-runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: win32
+            arch: x64
+            node_archive: win-x64
+          - runner: macos-13
+            platform: darwin
+            arch: x64
+            node_archive: darwin-x64
+          - runner: macos-14
+            platform: darwin
+            arch: arm64
+            node_archive: darwin-arm64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+            node_archive: linux-x64
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            node_archive: linux-x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      NODE_VERSION: 22.18.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - name: Download target Node runtime (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl --fail --location --output node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${{ matrix.node_archive }}.tar.xz"
+          tar -xf node.tar.xz
+      - name: Download target Node runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-${{ matrix.node_archive }}.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath .
+      - name: Package runtime
+        shell: bash
+        run: |
+          pnpm package:runtime "${{ matrix.platform }}" "${{ matrix.arch }}" "${GITHUB_WORKSPACE}/node-v${NODE_VERSION}-${{ matrix.node_archive }}" "${RUNNER_TEMP}/arc-runtime-output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arc-backend-runtime-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/arc-runtime-output/*.tar.gz
+          if-no-files-found: error

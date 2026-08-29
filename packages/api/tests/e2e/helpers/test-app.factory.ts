@@ -17,6 +17,11 @@ import {ValidationExceptionFilter} from '../../../src/infrastructure-wrapper/fil
 import {SessionRequiredFilter} from '../../../src/filters/session-required.filter.js';
 import {SessionModeNotAllowedFilter} from '../../../src/filters/session-mode-not-allowed.filter.js';
 import type {Logger} from '@arc/core';
+import {RuntimeInitializerService} from '../../../src/infrastructure-wrapper/runtime/runtime-initializer.service.js';
+import {RuntimePaths} from '../../../src/infrastructure-wrapper/runtime/runtime-paths.js';
+import {mkdtemp, rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
 
 /**
  * Create a proxy app that connects to an external running server
@@ -64,7 +69,10 @@ export function createExternalServerApp(
  * Note: Each test suite gets its own DataSource instance by overriding
  * the DataSourceProvider, which allows parallel test execution.
  */
-export async function createTestApp(): Promise<INestApplication> {
+export async function createTestApp(options?: {
+  initializeRuntime?: boolean;
+}): Promise<INestApplication> {
+  const testRuntimeRoot = await mkdtemp(path.join(tmpdir(), 'arc-api-runtime-'));
   // Create a custom DataSourceProvider that doesn't use singleton pattern
   class TestDataSourceProvider extends DataSourceProvider {
     private testInstance: DataSource | null = null;
@@ -110,6 +118,8 @@ export async function createTestApp(): Promise<INestApplication> {
     .useClass(MockJwtStrategy)
     .overrideProvider(DataSourceProvider)
     .useClass(TestDataSourceProvider)
+    .overrideProvider(RuntimePaths)
+    .useValue(new RuntimePaths(testRuntimeRoot))
     .compile();
 
   const app = moduleFixture.createNestApplication();
@@ -151,6 +161,10 @@ export async function createTestApp(): Promise<INestApplication> {
 
   // Initialize the application
   await app.init();
+
+  if (options?.initializeRuntime !== false) {
+    await app.get(RuntimeInitializerService).initialize();
+  }
 
   return app;
 }
@@ -218,6 +232,13 @@ export async function closeTestApp(app: INestApplication): Promise<void> {
     }
 
     await app.close();
+
+    try {
+      const runtimePaths = app.get(RuntimePaths);
+      await rm(runtimePaths.dataDir, {force: true, recursive: true});
+    } catch {
+      // The test app may have failed before the runtime provider was created.
+    }
   }
 }
 
