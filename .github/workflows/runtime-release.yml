@@ -56,10 +56,16 @@ jobs:
         run: |
           Invoke-WebRequest "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-${{ matrix.node_archive }}.zip" -OutFile node.zip
           Expand-Archive node.zip -DestinationPath .
-      - name: Package runtime
+      - name: Package runtime (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           pnpm package:runtime "${{ matrix.platform }}" "${{ matrix.arch }}" "${GITHUB_WORKSPACE}/node-v${NODE_VERSION}-${{ matrix.node_archive }}" "${RUNNER_TEMP}/arc-runtime-output"
+      - name: Package runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pnpm package:runtime '${{ matrix.platform }}' '${{ matrix.arch }}' "$env:GITHUB_WORKSPACE/node-v${env:NODE_VERSION}-${{ matrix.node_archive }}" "$env:RUNNER_TEMP/arc-runtime-output"
       - uses: actions/upload-artifact@v4
         with:
           name: arc-backend-runtime-${{ matrix.platform }}-${{ matrix.arch }}

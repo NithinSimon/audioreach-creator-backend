@@ -7,8 +7,12 @@ import {RuntimeHost} from '../../src/runtime-host.js';
 
 describe('RuntimeHost process recovery', () => {
   it('restarts a fixture that exits once and then becomes ready', async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), 'arc-runtime-host-process-'));
-    const fixture = fileURLToPath(new URL('./fixtures/fixture-api.mjs', import.meta.url));
+    const dataDir = await mkdtemp(
+      path.join(tmpdir(), 'arc-runtime-host-process-'),
+    );
+    const fixture = fileURLToPath(
+      new URL('./fixtures/fixture-api.mjs', import.meta.url),
+    );
     const runtimeHost = new RuntimeHost({
       dataDir,
       services: [

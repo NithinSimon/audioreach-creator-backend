@@ -25,7 +25,8 @@ export function resolveRuntimeConfig(
   }
 
   const requestedPort = Number(
-    environment.ARC_PORT ?? (mode === 'desktop' ? '0' : environment.PORT ?? '3000'),
+    environment.ARC_PORT ??
+      (mode === 'desktop' ? '0' : (environment.PORT ?? '3000')),
   );
   if (
     !Number.isInteger(requestedPort) ||

@@ -34,7 +34,9 @@ export default {
     },
     {
       displayName: 'integration',
+      preset: 'ts-jest/presets/default-esm',
       testEnvironment: 'node',
+      extensionsToTreatAsEsm: ['.ts'],
       roots: ['<rootDir>'],
       testMatch: ['**/tests/integration/**/*.spec.ts'],
       transform: {
@@ -47,6 +49,9 @@ export default {
         ],
       },
       resolver: 'jest-ts-webcompat-resolver',
+      moduleNameMapper: {
+        '^(\\.{1,2}/.*)\\.js$': '$1',
+      },
       collectCoverageFrom: ['src/**/*.ts', '!src/main.ts'],
       coverageDirectory: './coverage',
       coverageReporters: ['html', 'json'],

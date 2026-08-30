@@ -72,7 +72,9 @@ export function createExternalServerApp(
 export async function createTestApp(options?: {
   initializeRuntime?: boolean;
 }): Promise<INestApplication> {
-  const testRuntimeRoot = await mkdtemp(path.join(tmpdir(), 'arc-api-runtime-'));
+  const testRuntimeRoot = await mkdtemp(
+    path.join(tmpdir(), 'arc-api-runtime-'),
+  );
   // Create a custom DataSourceProvider that doesn't use singleton pattern
   class TestDataSourceProvider extends DataSourceProvider {
     private testInstance: DataSource | null = null;

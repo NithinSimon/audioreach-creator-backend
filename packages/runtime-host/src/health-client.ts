@@ -3,7 +3,10 @@ import {readFile} from 'node:fs/promises';
 export class HealthClient {
   constructor(private readonly timeoutMs = 5_000) {}
 
-  async isReady(endpointPath: string, readinessPath = '/health/ready'): Promise<boolean> {
+  async isReady(
+    endpointPath: string,
+    readinessPath = '/health/ready',
+  ): Promise<boolean> {
     try {
       const endpoint = JSON.parse(await readFile(endpointPath, 'utf8')) as {
         apiBaseUrl?: unknown;
@@ -12,7 +15,10 @@ export class HealthClient {
         return false;
       }
       const baseUrl = new URL(endpoint.apiBaseUrl);
-      if (baseUrl.protocol !== 'http:' || baseUrl.hostname !== '127.0.0.1') {
+      if (
+        baseUrl.protocol !== 'http:' ||
+        (baseUrl.hostname !== '127.0.0.1' && baseUrl.hostname !== '[::1]')
+      ) {
         return false;
       }
       const controller = new AbortController();

@@ -4,16 +4,20 @@ import path from 'node:path';
 
 export async function createRuntimeManifest(runtimeRoot, metadata) {
   const files = await listRuntimeFiles(runtimeRoot, ['runtime-manifest.json']);
-  return {
-    schemaVersion: 1,
-    ...metadata,
-    files: await Promise.all(
-      files.sort().map(async relativePath => ({
+  const sorted = files.sort();
+  const entries = [];
+  const concurrency = 64;
+  for (let i = 0; i < sorted.length; i += concurrency) {
+    const batch = sorted.slice(i, i + concurrency);
+    const batchEntries = await Promise.all(
+      batch.map(async relativePath => ({
         path: relativePath,
         sha256: await sha256File(path.join(runtimeRoot, relativePath)),
       })),
-    ),
-  };
+    );
+    entries.push(...batchEntries);
+  }
+  return {schemaVersion: 1, ...metadata, files: entries};
 }
 
 export async function verifyRuntimeManifest(runtimeRoot, manifest) {
@@ -32,7 +36,10 @@ export async function listRuntimeFiles(root, excludedNames = []) {
   async function visit(directory) {
     for (const entry of await readdir(directory, {withFileTypes: true})) {
       const absolutePath = path.join(directory, entry.name);
-      const relativePath = path.relative(root, absolutePath).split(path.sep).join('/');
+      const relativePath = path
+        .relative(root, absolutePath)
+        .split(path.sep)
+        .join('/');
       if (entry.isDirectory()) {
         await visit(absolutePath);
       } else if (entry.isFile() && !excluded.has(relativePath)) {

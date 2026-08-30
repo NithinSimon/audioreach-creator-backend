@@ -8,7 +8,10 @@ export class RuntimeHostLogger {
 
   async log(msg: string, fields: Record<string, unknown> = {}): Promise<void> {
     await mkdir(this.logsDir, {recursive: true});
-    this.file ??= await open(path.join(this.logsDir, 'runtime-host.jsonl'), 'a');
+    this.file ??= await open(
+      path.join(this.logsDir, 'runtime-host.jsonl'),
+      'a',
+    );
     await this.file.appendFile(
       `${JSON.stringify({
         msg,

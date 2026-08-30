@@ -4,10 +4,7 @@
  */
 
 import {Global, Module} from '@nestjs/common';
-import {
-  resolveRuntimeConfig,
-  type RuntimeConfig,
-} from './runtime-config.js';
+import {resolveRuntimeConfig, type RuntimeConfig} from './runtime-config.js';
 import {RuntimePaths} from './runtime-paths.js';
 import {ReadinessStateService} from './readiness-state.service.js';
 import {EndpointDiscoveryService} from './endpoint-discovery.service.js';

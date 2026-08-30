@@ -13,7 +13,7 @@ export class ReadinessMiddleware implements NestMiddleware {
   constructor(private readonly readiness: ReadinessStateService) {}
 
   use(request: Request, response: Response, next: NextFunction): void {
-    if (request.path.startsWith('/health/')) {
+    if (request.originalUrl.startsWith('/health/')) {
       next();
       return;
     }

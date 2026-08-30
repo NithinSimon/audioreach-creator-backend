@@ -22,11 +22,9 @@ describe('graceful runtime shutdown', () => {
     try {
       readiness.markReady();
       await discovery.publish(baseUrl);
-      const shutdown = new RuntimeShutdownService(
-        readiness,
-        discovery,
-        {destroy: async () => undefined} as any,
-      );
+      const shutdown = new RuntimeShutdownService(readiness, discovery, {
+        destroy: async () => undefined,
+      } as any);
       shutdown.attachApplication({close: async () => undefined} as any);
 
       await shutdown.shutdown(baseUrl);

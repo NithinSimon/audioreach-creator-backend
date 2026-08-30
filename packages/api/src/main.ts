@@ -14,9 +14,7 @@ import {ValidationExceptionFilter} from './infrastructure-wrapper/filters/valida
 import {SessionRequiredFilter} from './filters/session-required.filter.js';
 import {SessionModeNotAllowedFilter} from './filters/session-mode-not-allowed.filter.js';
 import type {AddressInfo} from 'node:net';
-import {
-  type RuntimeConfig,
-} from './infrastructure-wrapper/runtime/runtime-config.js';
+import {type RuntimeConfig} from './infrastructure-wrapper/runtime/runtime-config.js';
 import {RuntimeInitializerService} from './infrastructure-wrapper/runtime/runtime-initializer.service.js';
 import {RuntimeShutdownService} from './infrastructure-wrapper/runtime/runtime-shutdown.service.js';
 

@@ -50,6 +50,8 @@ describe('EndpointDiscoveryService', () => {
 
     await discovery.removeIfMatches('http://127.0.0.1:43123');
 
-    await expect(readFile(paths.endpointPath, 'utf8')).resolves.toContain('49000');
+    await expect(readFile(paths.endpointPath, 'utf8')).resolves.toContain(
+      '49000',
+    );
   });
 });

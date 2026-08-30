@@ -63,8 +63,6 @@ import {HealthModule} from './presentation/rest/modules/health/health.module.js'
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer
-      .apply(ReadinessMiddleware, RequestLoggerMiddleware)
-      .forRoutes('*');
+    consumer.apply(ReadinessMiddleware, RequestLoggerMiddleware).forRoutes('*');
   }
 }

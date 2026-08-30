@@ -5,13 +5,18 @@ import {RuntimeHost} from './runtime-host.js';
 
 export {HealthClient} from './health-client.js';
 export {RuntimeLock} from './runtime-lock.js';
-export {parseServiceManifest, type ServiceDefinition} from './service-manifest.js';
+export {
+  parseServiceManifest,
+  type ServiceDefinition,
+} from './service-manifest.js';
 export {RuntimeHost} from './runtime-host.js';
 export {RuntimeHostLogger} from './runtime-host-logger.js';
 
 async function main(): Promise<void> {
   const runtimeHostDirectory = path.dirname(fileURLToPath(import.meta.url));
-  const runtimeRoot = process.env.ARC_RUNTIME_ROOT ?? path.resolve(runtimeHostDirectory, '..', '..');
+  const runtimeRoot =
+    process.env.ARC_RUNTIME_ROOT ??
+    path.resolve(runtimeHostDirectory, '..', '..');
   const dataDir = process.env.ARC_DATA_DIR;
   if (!dataDir) {
     throw new Error('ARC_DATA_DIR is required for the runtime host');

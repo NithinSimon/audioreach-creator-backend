@@ -1,5 +1,6 @@
 import type {ChildProcess, SpawnOptions} from 'node:child_process';
 import {spawn as nodeSpawn} from 'node:child_process';
+import {mkdir, rm} from 'node:fs/promises';
 import path from 'node:path';
 import {HealthClient} from './health-client.js';
 import {RuntimeLock} from './runtime-lock.js';
@@ -44,9 +45,12 @@ export class RuntimeHost {
     this.orderedServices = orderServices(options.services);
     this.endpointPath = path.join(options.dataDir, 'runtime', 'endpoint.json');
     this.lockDirectory =
-      options.lockDirectory ?? path.join(options.dataDir, 'runtime', 'runtime-host.lock');
+      options.lockDirectory ??
+      path.join(options.dataDir, 'runtime', 'runtime-host.lock');
     this.healthClient = options.healthClient ?? new HealthClient();
-    this.logger = options.logger ?? new RuntimeHostLogger(path.join(options.dataDir, 'logs'));
+    this.logger =
+      options.logger ??
+      new RuntimeHostLogger(path.join(options.dataDir, 'logs'));
     this.spawnChild = options.spawnChild ?? nodeSpawn;
     this.startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 250;
@@ -58,7 +62,9 @@ export class RuntimeHost {
   }
 
   async currentHealth(): Promise<boolean> {
-    const api = this.orderedServices.find(service => service.id === 'offline-api');
+    const api = this.orderedServices.find(
+      service => service.id === 'offline-api',
+    );
     return this.healthClient.isReady(this.endpointPath, api?.readinessPath);
   }
 
@@ -66,6 +72,7 @@ export class RuntimeHost {
     if (this.lock) {
       return;
     }
+    await mkdir(path.dirname(this.lockDirectory), {recursive: true});
     try {
       this.lock = await RuntimeLock.acquire(this.lockDirectory);
     } catch (error) {
@@ -140,6 +147,7 @@ export class RuntimeHost {
           error: error instanceof Error ? error.message : String(error),
         });
         await this.stopChildren();
+        await rm(this.endpointPath, {force: true});
         if (attempt < this.maximumRetries) {
           await delay(Math.min(1_000 * 2 ** attempt, 10_000));
         }
@@ -212,7 +220,9 @@ export class RuntimeHost {
   }
 }
 
-function orderServices(services: readonly ServiceDefinition[]): readonly ServiceDefinition[] {
+function orderServices(
+  services: readonly ServiceDefinition[],
+): readonly ServiceDefinition[] {
   const byId = new Map(services.map(service => [service.id, service]));
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -229,7 +239,9 @@ function orderServices(services: readonly ServiceDefinition[]): readonly Service
     for (const dependencyId of service.dependsOn) {
       const dependency = byId.get(dependencyId);
       if (!dependency) {
-        throw new Error(`Service ${service.id} depends on unknown service ${dependencyId}`);
+        throw new Error(
+          `Service ${service.id} depends on unknown service ${dependencyId}`,
+        );
       }
       visit(dependency);
     }
@@ -244,11 +256,16 @@ function orderServices(services: readonly ServiceDefinition[]): readonly Service
   return ordered;
 }
 
-async function terminate(child: ChildProcess, timeoutMs: number): Promise<void> {
+async function terminate(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<void> {
   if (child.exitCode !== null) {
     return;
   }
-  const exited = new Promise<void>(resolve => child.once('exit', () => resolve()));
+  const exited = new Promise<void>(resolve =>
+    child.once('exit', () => resolve()),
+  );
   child.kill('SIGTERM');
   await Promise.race([exited, delay(timeoutMs)]);
   if (child.exitCode === null) {
