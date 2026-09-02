@@ -73,7 +73,7 @@ algorithm, with the discovered usecases identified by a canonical key-value iden
 
 #### FR-UC-01: Manual UC creation
 When a user provides a set of SGs with their SGKV instances (via the dedicated
-`create-manual-usecase` endpoint) and requests manual UC creation, the system shall:
+`create-manual-usecases` endpoint) and requests manual UC creation, the system shall:
 
 1. Apply the same 3-step KV resolution pipeline (FR-KV-01–03) using the provided
    SG→KV map and selected UCs.
@@ -145,7 +145,7 @@ sole KV source for routing. A SG absent from the map has no KV data for the algo
 to use. Providing `[]` is the deliberate way to declare "no KV contribution."
 
 #### FR-API-04: Manual mode uses a dedicated endpoint; server discovers links
-Manual UC creation (FR-UC-01) is served by a dedicated endpoint (`create-manual-usecase`)
+Manual UC creation (FR-UC-01) is served by a dedicated endpoint (`create-manual-usecases`)
 separate from the auto-routing endpoint (`create-usecases` for FR-UC-02).
 
 The manual endpoint's request body includes only:
@@ -172,7 +172,7 @@ deleting them from the DB.
 **Scope of exclusion:**
 - Applies only to the current API call. Excluded links are not persisted; no DB state
   change occurs.
-- Applies to both endpoints: `create-usecases` (FR-UC-02) and `create-manual-usecase`
+- Applies to both endpoints: `create-usecases` (FR-UC-02) and `create-manual-usecases`
   (FR-UC-01).
 - Only intra-usecase links are meaningful. Non-intra-usecase link IDs in the exclusion
   lists are silently ignored (they were not going to be traversed anyway).
@@ -215,7 +215,7 @@ current routing pass without deleting them from the DB.
 **Scope of exclusion:**
 - Applies only to the current API call. Excluded SGs are not persisted; no DB state
   change occurs.
-- Applies to both endpoints: `create-usecases` (FR-UC-02) and `create-manual-usecase`
+- Applies to both endpoints: `create-usecases` (FR-UC-02) and `create-manual-usecases`
   (FR-UC-01).
 
 **Effect on routing (SG removed from the routing context):**
@@ -660,7 +660,7 @@ carries a non-empty `perSg` (from FR-KV-03 API-supplied SGKV instances), the rou
 result shall include an `ARC-ROUTING-ORPHAN-SG-HAS-KVS` warning in addition to the
 standard orphan warning. This hint informs the user that if a stand-alone UC around
 that SG is intended, they may create it via the manual workflow
-(`create-manual-usecase` — FR-UC-01) rather than deleting the SG. The hint is
+(`create-manual-usecases` — FR-UC-01) rather than deleting the SG. The hint is
 non-blocking; the user may still accept the orphan as-is or delete it via
 FR-VAL-01's standard orphan workflow.
 
@@ -708,8 +708,11 @@ created during that session are discarded automatically.
 #### FR-LIFE-04: Fresh routing state per create-usecases call
 At the start of every `create-usecases` invocation (immediately after the chain-resolver
 pre-step, before Phase 1), the system shall delete all `edit_actions` in the current
-session with `source = AUTO_ROUTING`, regardless of `changeStatus` (STAGED or UNSTAGED).
-The routing pipeline then runs on the resulting state (committed + user's MANUAL edits).
+session with `source = AUTO_ROUTING`, regardless of operation, `changeStatus` (STAGED or
+UNSTAGED), or whether `validUntil` is null. This includes active and superseded
+CREATE/UPDATE/DELETE actions for UC base and relationship rows. It deletes uncommitted
+current-session action history only; committed data is not deleted. The routing pipeline
+then runs on the resulting state (committed + user's MANUAL edits).
 
 **Rationale:** the routing algorithm is idempotent — a fresh run on unchanged graph state
 produces the same output. Wiping prior algorithm output ensures each `create-usecases`
@@ -722,7 +725,7 @@ when the user's mental model shifts between calls.
 
 **Scope:**
 - Applies to `create-usecases` (auto routing) only.
-- Does NOT apply to `create-manual-usecase` — manual UC edit-actions use
+- Does NOT apply to `create-manual-usecases` — manual UC edit-actions use
   `source = MANUAL` and are not wiped.
 - Does NOT affect `source = MANUAL` edits (user's graph modifications and manual
   UC creations both use MANUAL) — they survive.
@@ -769,7 +772,7 @@ multi-SG path in the resulting broken graph.
 an isolated SG that still carries a non-empty effective KV instance set (from the
 API input), the SG shall surface as an orphan warning in Phase 10 with a hint
 suggesting the user create a single-SG UC via the manual workflow
-(`create-manual-usecase`). See FR-VAL-01 for the hint code
+(`create-manual-usecases`). See FR-VAL-01 for the hint code
 `ARC-ROUTING-ORPHAN-SG-HAS-KVS`.
 
 **Rationale:** auto workflow always produces multi-SG paths that represent a

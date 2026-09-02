@@ -414,7 +414,7 @@ for each uc in multiPathUcs:
 **Design rationale — multi-path UCs get no reconstruction.** These UCs were created
 manually (auto-routing only produces single-path shape per FR-STATUS-01). Attempting
 auto-reconstruction would produce a topologically-different UC — misleading to the
-user. If the user wants a replacement, they use `create-manual-usecase`.
+user. If the user wants a replacement, they use `create-manual-usecases`.
 
 #### 5.4.b Single-path branch (FR-DEL-06 steps 1–7)
 

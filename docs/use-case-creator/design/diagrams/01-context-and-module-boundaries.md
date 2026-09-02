@@ -15,7 +15,7 @@ flowchart LR
 
     subgraph Interface["Interface Layer"]
         httpAuto["POST /create-usecases\n(auto)"]
-        httpManual["POST /create-manual-usecase\n(manual)"]
+        httpManual["POST /create-manual-usecases\n(manual)"]
     end
 
     subgraph Framework["Framework / Glue"]

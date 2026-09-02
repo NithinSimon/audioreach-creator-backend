@@ -411,7 +411,7 @@ for each dl in input.graphEdits.deletedDataLinks:
 // Control-link edits: NOT seeds for the DFS cone.
 // DFS is data-link driven per FR-DFS-02; control-link edits do not trigger re-routing.
 // Exception: manual UC mode uses control-links for pair discovery, but that runs in
-// the create-manual-usecase handler, not via seed-driven routing.
+// the create-manual-usecases handler, not via seed-driven routing.
 ```
 
 **Edge case — pair already exists.** If a "new" data-link connects two SGs that

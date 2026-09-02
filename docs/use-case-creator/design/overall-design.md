@@ -23,8 +23,8 @@ This document is the overall design for the **auto use-case creator** feature. I
 the module boundaries, pipeline shape, data flow, port contracts, and cross-cutting
 invariants for two HTTP endpoints:
 
-- `POST /projects/{id}/use-cases/create-usecases` — auto routing (FR-UC-02)
-- `POST /projects/{id}/use-cases/create-manual-usecase` — manual UC creation (FR-UC-01)
+- `POST /arc-api/v1/projects/:projectId/create-usecases` — auto routing (FR-UC-02)
+- `POST /arc-api/v1/projects/:projectId/create-manual-usecases` — manual UC creation (FR-UC-01)
 
 Detailed algorithm design, DTOs, and repository method signatures are deferred to the
 LLDs listed in §12.
@@ -51,7 +51,7 @@ differences are handled inside the pipeline (some phases no-op in manual mode), 
 by duplicating the orchestrator.
 
 **Module placement.** The feature lives at
-`packages/core/src/application/usecase-designer/routing/`. It sits alongside the
+`packages/core/src/application/usecase-designer/auto-usecase-creator/`. It sits alongside the
 existing `spf-module/`, `container/`, etc. Domain entities (`Usecase`, `Subgraph`,
 `DataLink`, `ControlLink`) already exist in `packages/core/src/domain/`; this feature
 consumes them and does not introduce new aggregates.
@@ -146,30 +146,34 @@ in `RoutingContext.warnings` and surface in the response's `issues[]` — they d
 halt the pipeline.
 
 **Auto vs Manual mode.** Manual mode runs the same orchestrator with the same phase
-list, but Phases 2, 3, 5, 6, 7, 8 are no-ops (manual mode does not scan for deletion
+list, but Phases 2, 3, 5, 6, and 7 are no-ops (manual mode does not scan for deletion
 or transitions; SGs are provided so no seed/cone/DFS work is needed). Phase 4 runs with
-mode-specific logic (resolves the provided GKVs). Phase 9 runs partial (idempotency
-check only — no duplicate merge, since manual is one UC at a time). This avoids two
-divergent code paths.
+mode-specific logic (resolves the provided GKVs). Phase 8 expands the ordered
+`activeSubgraphs` synthetic path so every valid SGKV Cartesian combination becomes a
+candidate UC. Phase 9 runs partial (idempotency check only). This avoids two divergent
+code paths.
 
-**Commit safety-net is separate.** FR-COMMIT-01 checks (a)/(b)/(c)/(d) — direction
-correction, path re-validation, orphan detection, manual UC referential integrity —
-run at `POST /commit-changes`, NOT inside the routing pipeline. Design ownership:
-edit-crud commit LLD; this feature only defines the contract.
+**Commit safety-net is separate.** FR-COMMIT-01 checks (a)/(b1)/(b2)/(c)/(d) —
+direction correction, staged-UC validation, existing-UC invalidation after structural
+deletion, orphan detection, and manual UC referential integrity — run at
+`POST /commit-changes`, NOT inside the routing pipeline. Design ownership: edit-crud
+commit LLD; this feature only defines the contract.
 
 **Handler pre-step for `create-usecases` — FR-LIFE-04 wipe.** Before invoking
 `RoutingEngine.run`, and immediately after the chain-resolver pre-step, the
 `create-usecases` handler deletes all `edit_actions` in the current session where
-`source = AUTO_ROUTING`. This ensures each auto-routing invocation reflects the current
-graph state cleanly. `create-manual-usecase` does not perform this wipe — manual UC
-output uses `source = MANUAL` (same as graph edits) and is preserved across
-auto-routing calls.
+`source = AUTO_ROUTING`. The deletion covers active and superseded rows, every operation,
+and UC base and relationship actions. It affects uncommitted current-session actions
+only; committed data and other sources are preserved. This ensures each auto-routing
+invocation reflects the current graph state cleanly. `create-manual-usecases` does not
+perform this wipe — manual UC output uses `source = MANUAL` (same as graph edits) and is
+preserved across auto-routing calls.
 
 **Source enum values used by this feature:**
 
 | Value | Emitted by | Wiped by `create-usecases` FR-LIFE-04? |
 |---|---|---|
-| `MANUAL` | User's graph editing endpoints (add SG, add link, patch, etc.); chain resolver; `create-manual-usecase` handler | No |
+| `MANUAL` | User's graph editing endpoints (add SG, add link, patch, etc.); chain resolver; `create-manual-usecases` handler | No |
 | `AUTO_ROUTING` | `create-usecases` handler (auto-routing pipeline output) | **Yes** |
 | `DIFF_TOOL` | Diff-merge tooling (out of scope for this feature) | No |
 
@@ -186,8 +190,9 @@ that carries no behavioral difference from `MANUAL`.
 See [`diagrams/03-routing-context-data-flow.md`](./diagrams/03-routing-context-data-flow.md)
 for the field layout and per-phase read/write table.
 
-**RoutingContext** is a mutable data container threaded through all 12 phases. The
-handler constructs it with `input` and `mode`, then hands it to `RoutingEngine.run`.
+**RoutingContext** is a mutable data container threaded through all 12 phases.
+`RoutingEngine.run` constructs it from `input` and `mode`, then invokes its fixed phase
+sequence.
 Each phase writes its owned field once; downstream phases read. The only exception is
 `warnings` — appendable by any phase.
 
@@ -198,19 +203,25 @@ mode:
 |---|---|---|---|
 | `mode` | ✓ | ✓ | handler |
 | `activeSubgraphs` (SG + SGKV selections per SG) | ✓ | ✓ | client payload |
-| `selectedUsecaseSystemIds` (which existing UCs to include in routing scope) | ✓ | — | client payload |
+| `selectedUsecaseSystemIds` (which existing UCs to include in routing scope) | ✓ | ✓ | client payload |
 | `excludedDataLinkSystemIds` | ✓ | ✓ | client payload |
 | `excludedControlLinkSystemIds` | ✓ | ✓ | client payload |
 | `excludedSubgraphSystemIds` (FR-API-06) | ✓ | ✓ | client payload |
 | `graphEdits` (added/deleted SGs, data-links, control-links since last routing) | ✓ | ✓ | handler (assembled from aggregate repo `findManualEditsSinceLastRouting` calls) |
 | `staleUcs` (Disconnected UCs from prior sessions) | ✓ | — | handler (repo query) |
+| `manualTopology` (derived pairs, supporting links, isolated SGs) | — | ✓ | `ManualPairDiscoveryService` after chain resolution |
 
 `graphEdits` and `staleUcs` are derived state — the handler populates them via port
 queries before invoking `RoutingEngine`. They are **not** client-provided.
 
 In manual mode, the "SGs forming the new UC" set is `activeSubgraphs.map(s => s.sgSystemId)` —
 no separate field. Pair derivation happens server-side (FR-UC-01) via data-link query
-with control-link fallback.
+with control-link fallback. `ManualPairDiscoveryService` examines every unordered SG
+pair after explicitly excluded SGs are removed (relative order preserved), and it
+applies explicit data/control-link exclusions during discovery. Links incident to an
+excluded SG are implicitly absent. Phase 8 consumes the same filtered SG list. Request
+order is retained only for deterministic combination expansion and does not define
+topology.
 
 **Why `graphEdits`:** Phase 5 (SeedDetection) needs to know *what the user just changed*
 so it can focus routing on those SGs rather than re-scan the whole graph. Phase 2
@@ -242,9 +253,10 @@ create-usecases command.
 
 **Transaction boundary.** The handler owns the tx — same shape as
 `PatchSpfModuleHandler`. `startTransaction()` → chain resolver pre-step → build
-`RoutingInput` → `RoutingEngine.run(input, uow)` → `commit()`. On any thrown
-exception: rollback and rethrow. Exact signature and try/catch structure is in the
-LLD6 handler section — this doc only fixes the shape.
+`RoutingInput` → `RoutingEngine.run(input, uow)` → `commit()`. For automatic routing,
+the source-scoped cleanup occurs after chain resolution and before input construction.
+On any thrown exception: rollback and rethrow. Exact signature and try/catch structure
+is in the LLD6 handler section — this doc only fixes the shape.
 
 **One tx covers everything** — chain resolver writes, all AUTO_ROUTING `edit_actions`
 from the pipeline, and any repository mutations that happen along the way. Any failure
@@ -330,7 +342,7 @@ queries and stitched together by the handler. This matches the pattern in
 |---|---|---|
 | `IUsecaseRepository` | `findAll(fileSystemId, {readMode?})` | Phase 2 — load all UCs (readMode=Committed for pre-session impact detection). Consumers filter in memory over `context.allUcs`. |
 | | `findBySystemIds(fileSystemId, ucSystemIds, {readMode?})` | Handler — batch load specific UCs. |
-| | `findWithActiveManualEdits(fileSystemId)` | Phase 9 — stale MANUAL edit-action pre-check (FR-DUP-04). |
+| | `findWithActiveManualEdits(fileSystemId)` | Phase 9 — active MANUAL CREATE/UPDATE records with `changeId`, effective UC, operation, and nullable dependency payload for stale-edit validation/autofix. |
 | | `create(uc, options?, referencedComponents?)` | Phase 11 |
 | | `applyStructuralChange(uc, delta, options?, referencedComponents?)` | Phase 11 — atomic add/remove SGs+pairs+type update; also FR-EC-07 Rule D un-mark. |
 | | `changeType(uc, newType, options?)` | Phase 11 — type-only mutation (FR-STATUS-02(b), pure Rule E). |
@@ -420,13 +432,25 @@ interface IUsecaseRepository {
   // ... existing find methods ...
   findAll(fileSystemId: string, options?: ReadOptions): Promise<Usecase[]>;
   findBySystemIds(fileSystemId: string, ucSystemIds: readonly number[], options?: ReadOptions): Promise<Usecase[]>;
-  findWithActiveManualEdits(fileSystemId: string): Promise<Usecase[]>;
+  findWithActiveManualEdits(fileSystemId: string): Promise<ActiveManualUsecaseEdit[]>;
 
   create(uc: Usecase, options?: EditOptions, referencedComponents?: ReferencedComponents): Promise<void>;
   applyStructuralChange(uc: Usecase, delta: StructuralDelta, options?: EditOptions, referencedComponents?: ReferencedComponents): Promise<void>;
   changeType(uc: Usecase, newType: UsecaseType, options?: EditOptions): Promise<void>;
   reverseDirection(uc: Usecase, currentSourceSgSystemId: number, currentDestSgSystemId: number, options?: EditOptions): Promise<void>;
   delete(uc: Usecase, options?: EditOptions): Promise<void>;
+}
+```
+
+`ActiveManualUsecaseEdit` preserves invalid rows for Phase 9 reporting instead of
+silently dropping them:
+
+```ts
+interface ActiveManualUsecaseEdit {
+  changeId: number;
+  usecase: Usecase | null;
+  operation: 'CREATE' | 'UPDATE';
+  referencedComponents: ReferencedComponents | null;
 }
 ```
 
@@ -597,7 +621,7 @@ Warnings (surface in `data.issues[]`, HTTP 200):
 - `ARC-ROUTING-ORPHAN-SUBSYSTEM` (autofix=delete)
 - `ARC-ROUTING-ORPHAN-INTRA-LINK` (autofix=delete) — data-link and control-link;
   `impactedEntity.linkKind` distinguishes
-- `ARC-ROUTING-ORPHAN-SG-HAS-KVS` (hint=create-manual-usecase) — an orphan SG with
+- `ARC-ROUTING-ORPHAN-SG-HAS-KVS` (hint=create-manual-usecases) — an orphan SG with
   non-empty effective SGKV instances after auto routing. Suggests the user create a
   stand-alone UC via the manual workflow (FR-UC-01) rather than deleting the SG.
   Non-blocking; user may still accept the orphan or use the standard delete flow.
@@ -698,6 +722,9 @@ Per the frozen requirements §6:
 **In scope for this delivery** (previously listed here as out-of-scope; corrected 2026-08-10):
 - EC (Echo Cancellation) routing — 3-UC generation for Rx/Tx domain bridges. Owned by LLD5.
 - MDF single-rule support (FR-MDF-01 IsMdf attribute) — folded into plan.
+- Structural UC replacement (FR-UC-UPDATE-01) — delivered as a separate write API
+  after the routing and commit-safety chapters. It reuses manual SGKV/GKV validation
+  but is not a third mode of the 12-phase routing pipeline.
 
 ---
 
@@ -716,7 +743,8 @@ into the implementation plan.
 | LLD5 | `lld5-ec-routing.md` | EC (Echo Cancellation) routing: detection, DFS boundary override, 3-UC generation, Bridge KV compatibility, single-EC-per-path, EC bridge lifecycle, legacy EC UC compatibility (Bridge suppression, cross-EC reconstruction delegation, max-1-EC-per-UC with MDF exception, type recomputation). FR-EC-01..07 |
 | — (folded into plan) | — | Phase 9 Classification + Phase 10 OrphanValidation: FR-DUP-03(a) exact-match no-op + FR-DUP-03(b1) identity-preserving interior extension silent auto-update + FR-DUP-04 same-GKV user-choice collision handling (including `ARC-ROUTING-SAME-GKV-CHOICE-REQUIRED` issue emission, apply-fix command, re-run recognition via GKV+SG+pair match against `source=MANUAL` edit-actions, Phase 9 pre-check for stale MANUAL edit-actions emitting `ARC-ROUTING-MANUAL-UC-BROKEN-DEPS`), FR-VAL-01/02/03, FR-LIFE-01/02/03, FR-STATUS-01/02/03. Rule-driven; the plan carries the rule table directly. Also folds in FR-EC-07 Rule D (Phase 11 emission of reconstruction-updated UCs and un-marking from `markedForDeletion` on FR-DUP-03(b1) match) and FR-EC-07 Rule E (recomputing `Usecase.type` from pair set at Phase 11 stager). |
 | — (folded into plan) | — | Phase 11 RoutingChangeStager + Phase 12 ResponseBuilder + DTO/adapter shapes: FR-KV-COMMIT-01/02/03. MDF single rule (FR-MDF-01). Manual UC creation flow (FR-UC-01) including server-side pair discovery via `IDataLinkRepository.findLinksByPair` + control-link fallback per FR-UC-01 step 4 with smaller-SG-ID direction rule and isolated-SG warning. `degradedToDisconnected` UC updates from FR-STATUS-02(b) (emit `usecaseRepo.update(uc, {type: 'Disconnected'})` + `ARC-ROUTING-UC-AUTO-DISCONNECTED` warning). |
-| — (not owned by this feature) | — | `FR-STAGE-01` (orphan handling on stage API) is owned by the edit-crud stage-changes handler, not this feature. Same for `FR-COMMIT-01` — commit safety-net contract; enforced at `POST /commit-changes` by the edit-crud commit LLD. This feature only defines the contract those handlers must uphold. |
+| — (folded into plan) | — | Structural UC replacement API (FR-UC-UPDATE-01): separate PUT handler; shared manual SGKV/GKV validation; atomic GKV + SG + pair replacement; no new routing-engine mode. |
+| — (not owned by this feature) | — | `FR-STAGE-01` (orphan handling on stage API) is owned by the edit-crud stage-changes handler, not this feature. Same for `FR-COMMIT-01` — commit safety-net contract, including (b2) affected-existing-UC validation after staged deletion; enforced at `POST /commit-changes` by the edit-crud commit LLD. This feature only defines the contract those handlers must uphold. |
 
 Commit-time safety net (FR-COMMIT-01) is not owned by this feature's LLDs — it's a
 contract on the edit-crud commit LLD.

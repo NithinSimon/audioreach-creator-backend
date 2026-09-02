@@ -323,7 +323,7 @@ new candidate, orthogonal to the original Disconnected UC's fate).
      - **Accept deletion:** UC dropped at commit.
      - **Preserve as Disconnected:** UC's SG set and pair set are trimmed to only
        surviving components. Auto-routing does not attempt to discover replacement
-       paths — the user must manually re-declare via `create-manual-usecase` if they
+       paths — the user must manually re-declare via `create-manual-usecases` if they
        want a different topology.
 
 *This enables the system to detect path transformations (e.g., `A→B` becoming
@@ -367,7 +367,7 @@ pre-validation) → routing pipeline (KV resolution, cone, DFS, etc.).
 **Applies to both endpoints:**
 - `create-usecases` (auto-routing, FR-UC-02) — routing depends on complete
   intra-usecase data-links.
-- `create-manual-usecase` (manual, FR-UC-01) — manual pair derivation queries DB
+- `create-manual-usecases` (manual, FR-UC-01) — manual pair derivation queries DB
   data-links and control-links (FR-UC-01 step 4); those queries also depend on
   chain resolution being complete.
 
@@ -422,7 +422,7 @@ the data-link direction. Corrected pairs are staged as UPDATE edit-actions befor
 commit proceeds. After correction, evaluate FR-STATUS-04 Step 2 (coverage) — a UC that
 now has all pairs covered transitions to Connected as part of the same commit.
 
-**(b) Path re-validation for newly staged UCs (original FR-COMMIT-01):**
+**(b1) Path re-validation for newly staged UCs (original FR-COMMIT-01):**
 
 For every newly created staged UC (regardless of Connected or Disconnected status):
 
@@ -458,10 +458,41 @@ For every newly created staged UC (regardless of Connected or Disconnected statu
 Any UC that fails path re-validation causes the commit to be rejected with an error
 identifying the failing UCs and the offending pairs.
 
-*Scope for (b):* Applies to staged UCs created in the current edit session. It does not
-modify or validate existing committed UCs (governed by FR-LIFE-01 in the core reqs). It
-catches the case where a structural change occurred between the routing call and the
-commit call, breaking a newly staged UC's path.
+*Scope for (b1):* Applies to staged UCs created in the current edit session. It catches
+the case where a structural change occurred between the routing call and the commit
+call, breaking a newly staged UC's path.
+
+**(b2) Existing-UC invalidation after staged structural deletion:**
+
+When the commit scope contains a staged DELETE for an SG, data-link, or control-link,
+the system shall identify existing committed UCs that referenced the deleted SG or the
+deleted link's SG pair in the committed pre-session state. This lookup must not rely
+only on the session overlay because the overlay can already hide the deleted component
+or cascaded UC junction rows.
+
+Each affected UC shall then be re-validated against the effective post-commit state:
+
+- Every SG still referenced by the UC must exist.
+- Every stored pair must retain at least one supporting intra-usecase data-link or
+  control-link in either direction (I7).
+- A Connected UC must still satisfy the Connected-status coverage rule from (b1).
+- If another surviving link still supports the pair, the link deletion alone does not
+  invalidate the UC.
+- If staged routing output, a structural UC update, or a staged UC deletion has already
+  normalized the affected UC, that UC passes this check.
+
+The check is state-based: it does not track whether `create-usecases` was called. If an
+affected UC remains stale, reject the entire commit with HTTP 422 and issue code
+`ARC-COMMIT-ROUTING-REQUIRED`. The issue shall identify the affected UC system IDs,
+offending SGs/pairs, and triggering deleted component IDs, and direct the client to call
+`POST /arc-api/v1/projects/:projectId/create-usecases` with the affected UCs selected
+before retrying commit. The user may instead explicitly update/delete the affected UC
+or restore the deleted component; any remediation is accepted when the resulting
+effective post-commit state satisfies this check.
+
+This closes the direct-commit gap: deleting the only link supporting an existing UC
+pair cannot pass merely because the deleted link is no longer present to be reported as
+an orphan by check (c).
 
 **(c) Orphan detection safety net (enforces I5, FR-VAL-01, FR-VAL-02, FR-VAL-03):**
 
@@ -493,7 +524,7 @@ edit-action's creation time) still exists in the effective post-commit graph AND
 not marked for deletion.
 
 **Applies to:**
-- Manual UC creation via `create-manual-usecase` (`operation = CREATE`).
+- Manual UC creation via `create-manual-usecases` (`operation = CREATE`).
 - FR-DUP-04 user-choice materializations:
   - `CREATE` edit-actions from `PATH_A` / `PATH_B` / `MERGE` (two new paths) or
     `REPLACE_WITH_NEW` (new vs existing DB UC);
@@ -529,18 +560,18 @@ than adding cross-edit-action integrity checks at delete time (which would be
 expensive across many handlers), the commit-time gate catches the inconsistency
 uniformly. The autofix mechanism preserves the user's ability to still commit
 their other staged edits — they just lose the broken manual UC (which they can
-recreate via `create-manual-usecase` or by re-running `create-usecases` and
+recreate via `create-manual-usecases` or by re-running `create-usecases` and
 re-selecting the collision option, if still wanted).
 
-*Interaction with recreation:* if the user re-invokes `create-manual-usecase`
+*Interaction with recreation:* if the user re-invokes `create-manual-usecases`
 after the autofix, the new manual UC edit-action captures a fresh
 `referencedComponents` reflecting the current graph state. Direction/component
 drift is corrected implicitly at recreation.
 
-**Rejection semantics:** Checks (a), (b), (c), (d) run in order. Any failure causes the
-whole commit to be rejected — no partial commit. The response identifies which check
-failed and which entities caused the failure. Autofix suggestions per check may be
-combined by the client before retrying the commit.
+**Rejection semantics:** Checks (a), (b1), (b2), (c), (d) run in order. Any failure
+causes the whole commit to be rejected — no partial commit. The response identifies
+which check failed and which entities caused the failure. Autofix suggestions per check
+may be combined by the client before retrying the commit.
 
 ---
 
@@ -563,6 +594,85 @@ a path that includes an MDF bridge SG, it is treated as pass-through — no KV
 contribution, no API map entry required (FR-MDF-01). The user does not need to
 explicitly include or assign KVs to MDF bridge SGs; the system handles them
 transparently.
+
+### W5 / FR-UC-UPDATE-01: Replace an existing UC's structure
+
+The system shall expose
+`PUT /arc-api/v1/projects/:projectId/usecases/:usecaseSystemId/structure` to replace one
+existing UC's GKV, SG membership, and SG-pair set atomically. This is a new structural
+write API; it does not extend the existing alias-only `PATCH /usecases/:usecaseSystemId`.
+
+**Request:**
+
+```typescript
+{
+  activeSubgraphs: Array<{
+    systemId: string;
+    valueSystemIds: string[]; // exactly one selected SGKV case
+  }>;
+  dataLinkSystemIds: string[]; // exact selected data links; may be empty
+}
+```
+
+**Validation and behavior:**
+
+- The target UC, every selected SG, every selected SGKV, and every selected data-link
+  must exist in the same file's effective session overlay.
+- `activeSubgraphs` must be non-empty and contain unique SG IDs. Each entry selects
+  exactly one SGKV case. The selected SGKVs must combine into exactly one internally
+  consistent, non-empty UC GKV using the same pure GKV validation rules as manual UC
+  creation.
+- `dataLinkSystemIds` is the complete desired data-link selection. Every selected link
+  must have both endpoint SGs in `activeSubgraphs`. The server derives directed SG pairs
+  from those links and deduplicates repeated SG pairs.
+- Control-link IDs are not accepted or auto-discovered by this API.
+- Disconnected structures and isolated selected SGs are valid. An empty data-link list
+  is therefore allowed.
+- If another effective UC already owns the resulting GKV, reject with HTTP 409 and
+  identify the conflicting UC. The target UC itself is excluded from this comparison.
+- Replace the target UC's GKV rows, SG membership rows, and SG-pair rows as one
+  handler-owned transaction. Any failure rolls back the complete replacement.
+- Recompute the resulting internal UC type from the replacement topology using the
+  existing `Connected` / `Disconnected` / `EC` classification rules. Emit
+  `source = MANUAL` edit-actions using the shared MANUAL staging policy; edit source
+  records provenance and is not a UC type.
+- Store `referencedComponents = {sgSystemIds, dataLinkSystemIds,
+  controlLinkSystemIds: []}` on the UC UPDATE edit-action so FR-COMMIT-01(d) can validate
+  it at stage/commit time.
+- Allow only active `DESIGNER` and `DIFF_MERGE` sessions.
+
+**Response:** HTTP 200 with the effective updated UC plus the ambient edit-action
+`groupId`, nested so operation metadata is separate from entity data:
+
+```typescript
+{
+  usecase: {
+    systemId: string;
+    keyValuePairs: KeyValuePairDto[];
+    usecaseAliasId?: number;
+    usecaseAliasName?: string;
+    usecaseCategory?: string;
+    changeId: string;
+    subgraphSystemIds: string[];
+    subgraphPairs: Array<{
+      sourceSubgraphSystemId: string;
+      destSubgraphSystemId: string;
+    }>;
+  };
+  groupId: string;
+}
+```
+
+The response reuses the public UC identifier fields exposed by the create-usecases and
+create-manual-usecases APIs, then adds effective SG membership and SG pairs. It does not
+expose the internal UC type; the implementation recomputes that type from the resulting
+topology for internal routing behavior.
+
+**Implementation boundary:** reuse the pure SGKV/GKV validation extracted for manual
+UC creation, but do not add an Update mode to the 12-phase auto-routing pipeline. The
+handler computes a delta from the current overlay UC and extends the existing atomic
+`UsecaseRepository.applyStructuralChange` capability to replace GKV relationships in
+the same edit-action group.
 
 ---
 

@@ -80,7 +80,7 @@ flowchart TD
 
 ## 2b. Phase applicability by mode
 
-Compares which of the 12 pipeline phases execute in Auto mode (`create-usecases`) versus Manual mode (`create-manual-usecase`), highlighting phases that are skipped or run with different logic in Manual mode.
+Compares which of the 12 pipeline phases execute in Auto mode (`create-usecases`) versus Manual mode (`create-manual-usecases`), highlighting phases that are skipped or run with different logic in Manual mode.
 
 ```mermaid
 flowchart LR
@@ -105,7 +105,7 @@ flowchart LR
         A1 --> A2 --> A3 --> A4 --> A5 --> A6 --> A7 --> A8 --> A9 --> A10 --> A11 --> A12
     end
 
-    subgraph MANUAL["Manual mode (create-manual-usecase)"]
+    subgraph MANUAL["Manual mode (create-manual-usecases)"]
         direction TB
         M1["1 · PreValidationService"]:::runs
         M2["2 · DeletionScopeService\n(skipped — creates one new UC, no deletion scan)"]:::skipped
@@ -114,7 +114,7 @@ flowchart LR
         M5["5 · SeedDetectionService\n(skipped — SGs provided)"]:::skipped
         M6["6 · ConeComputationService\n(skipped)"]:::skipped
         M7["7 · DfsRoutingService\n(skipped — pairs via DB query per FR-UC-01)"]:::skipped
-        M8["8 · CombinationExpansionSvc\n(skipped)"]:::skipped
+        M8["8 · CombinationExpansionSvc\n(expands ordered activeSubgraphs path)"]:::different
         M9["9 · ClassificationService\n(partial — idempotency check only)"]:::different
         M10["10 · OrphanValidationService"]:::runs
         M11["11 · RoutingChangeStager"]:::runs
