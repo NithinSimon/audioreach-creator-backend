@@ -639,6 +639,22 @@ export type {
 // Auto-usecase-creator — UsecaseRepository port and types
 export type {
   UsecaseRepository,
+  ActiveManualUsecaseEdit,
   ReferencedComponents,
   StructuralDelta,
 } from './application/ports/persistence/repositories/usecase/usecase.repository.js';
+
+// Auto-usecase-creator routing scaffold
+export * from './application/usecase-designer/auto-usecase-creator/contracts/routing-input.js';
+export * from './application/usecase-designer/auto-usecase-creator/contracts/routing-state.js';
+export * from './application/usecase-designer/auto-usecase-creator/contracts/routing-outcome.js';
+export * from './application/usecase-designer/auto-usecase-creator/contracts/routing-context.js';
+export * from './application/usecase-designer/auto-usecase-creator/contracts/routing-phase.js';
+export * from './application/usecase-designer/auto-usecase-creator/engine/routing-engine.js';
+export * from './application/usecase-designer/auto-usecase-creator/engine/create-routing-engine.js';
+export * from './application/usecase-designer/auto-usecase-creator/services/manual-pair-discovery.service.js';
+export * from './application/usecase-designer/auto-usecase-creator/services/subsystem-link-resolution.service.js';
+export * from './application/usecase-designer/auto-usecase-creator/create-usecases/create-usecases.command.js';
+export * from './application/usecase-designer/auto-usecase-creator/create-usecases/create-usecases.handler.js';
+export * from './application/usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.command.js';
+export * from './application/usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.handler.js';

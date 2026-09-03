@@ -101,6 +101,10 @@ import {DeleteControlLinkCommand} from '../../../usecase-designer/control-links/
 import {DeleteControlLinkHandler} from '../../../usecase-designer/control-links/delete/delete-control-link.handler.js';
 import {PutCkvCalDataCommand} from '../../../usecase-designer/spf-module/put-cal-data/put-ckv-cal-data.command.js';
 import {PutCkvCalDataHandler} from '../../../usecase-designer/spf-module/put-cal-data/put-ckv-cal-data.handler.js';
+import {CreateUsecasesCommand} from '../../../usecase-designer/auto-usecase-creator/create-usecases/create-usecases.command.js';
+import {CreateUsecasesHandler} from '../../../usecase-designer/auto-usecase-creator/create-usecases/create-usecases.handler.js';
+import {CreateManualUsecasesCommand} from '../../../usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.command.js';
+import {CreateManualUsecasesHandler} from '../../../usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.handler.js';
 
 export interface CommandHandlerDependencies {
   uow: UnitOfWork;
@@ -260,6 +264,14 @@ export class CommandHandlerRegistry {
 
     this.commandHandlerFactories.set(PutCkvCalDataCommand, {
       create: deps => new PutCkvCalDataHandler(deps.uow, deps.logger),
+    });
+
+    this.commandHandlerFactories.set(CreateUsecasesCommand, {
+      create: deps => new CreateUsecasesHandler(deps.uow),
+    });
+
+    this.commandHandlerFactories.set(CreateManualUsecasesCommand, {
+      create: deps => new CreateManualUsecasesHandler(deps.uow),
     });
   }
 }

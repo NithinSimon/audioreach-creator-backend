@@ -7,6 +7,7 @@ import type {DataSource, QueryRunner} from 'typeorm';
 import {
   USECASE_TYPE,
   SOURCE,
+  CHANGE_OPERATION,
   READ_MODE,
   type IdGenerationPort,
 } from '@arc/core';
@@ -26,6 +27,7 @@ import {TypeOrmUsecaseRepository} from '../../../../src/persistence-typeorm-sqll
 import {PendingChangeWriter} from '../../../../src/persistence-typeorm-sqllite/services/pending-change-writer.js';
 import {PendingChangeCache} from '../../../../src/persistence-typeorm-sqllite/services/pending-change-cache.js';
 import {EditActionsQueryService} from '../../../../src/persistence-typeorm-sqllite/queries/edit-session/edit-actions-query-service.js';
+import {ENTITY_NAMES} from '../../../../src/persistence-typeorm-sqllite/entity-schema/entity-table-names.js';
 import {ProjectSchema} from '../../../../src/persistence-typeorm-sqllite/entity-schema/project-data/project.schema.js';
 import {ArcDbFileSchema} from '../../../../src/persistence-typeorm-sqllite/entity-schema/project-data/arc-db-file.schema.js';
 import {ProjectSessionSchema} from '../../../../src/persistence-typeorm-sqllite/entity-schema/edit-session/project-session.schema.js';
@@ -210,6 +212,68 @@ describe('TypeOrmUsecaseRepository (integration)', () => {
       expect(result[0].type).toBe(USECASE_TYPE.Connected);
     });
 
+    it('includes only the requested session-created usecase', async () => {
+      const repo = makeRepo(qr.manager, sessionId);
+      await qr.startTransaction();
+      await repo.create(
+        new UseCase({
+          systemId: 9001,
+          fileSystemId: FILE_ID,
+          alias: 'session-created',
+          keyVector: {valueSystemIds: []},
+          subgraphSystemIds: [],
+          subgraphPairs: [],
+        }),
+        {source: SOURCE.AutoRouting},
+      );
+      await qr.commitTransaction();
+
+      await expect(repo.findBySystemIds(FILE_ID, [9001])).resolves.toEqual([
+        expect.objectContaining({systemId: 9001}),
+      ]);
+      await expect(repo.findBySystemIds(FILE_ID, [9002])).resolves.toEqual([]);
+    });
+
+    it('hydrates session-created GKV values and applies their DELETE payload', async () => {
+      const repo = makeRepo(qr.manager, sessionId);
+      const uc = new UseCase({
+        systemId: 9001,
+        fileSystemId: FILE_ID,
+        alias: 'gkv-overlay',
+        keyVector: {valueSystemIds: [7001, 7002]},
+        subgraphSystemIds: [],
+        subgraphPairs: [],
+      });
+      await qr.startTransaction();
+      await repo.create(uc, {source: SOURCE.AutoRouting});
+      await qr.commitTransaction();
+
+      expect(
+        (await repo.findBySystemIds(FILE_ID, [uc.systemId]))[0].keyVector
+          .valueSystemIds,
+      ).toEqual([7001, 7002]);
+
+      await qr.startTransaction();
+      await makeWriter(qr.manager).writeDelete(
+        {
+          targetTable: ENTITY_NAMES.UsecaseGkvValues,
+          targetSystemId: 9003,
+          aggregateId: uc.systemId,
+          payload: {usecaseSystemId: uc.systemId, valueDefSystemId: 7001},
+          source: SOURCE.AutoRouting,
+        },
+        sessionId,
+        'test-group',
+        qr.manager,
+      );
+      await qr.commitTransaction();
+
+      expect(
+        (await repo.findBySystemIds(FILE_ID, [uc.systemId]))[0].keyVector
+          .valueSystemIds,
+      ).toEqual([7002]);
+    });
+
     it('hydrates subgraphSystemIds and subgraphPairs', async () => {
       await seedUseCase(ds, 1000, 1, 'uc-a', USECASE_TYPE.Connected);
       await linkSg(ds, 1000, SG_ID_1);
@@ -281,7 +345,13 @@ describe('TypeOrmUsecaseRepository (integration)', () => {
       );
       const repo = makeRepo(qr.manager, sessionId);
       const result = await repo.findWithActiveManualEdits(FILE_ID);
-      expect(result.map(u => u.systemId)).toContain(1000);
+      expect(result).toEqual([
+        expect.objectContaining({
+          usecase: expect.objectContaining({systemId: 1000}),
+          operation: CHANGE_OPERATION.Create,
+          referencedComponents: null,
+        }),
+      ]);
     });
 
     it('excludes AUTO_ROUTING edits', async () => {
@@ -293,6 +363,62 @@ describe('TypeOrmUsecaseRepository (integration)', () => {
       );
       const repo = makeRepo(qr.manager, sessionId);
       expect(await repo.findWithActiveManualEdits(FILE_ID)).toEqual([]);
+    });
+
+    it('preserves each manual action metadata and hydrated usecase', async () => {
+      await seedUseCase(ds, 1000, 1, 'uc-a', USECASE_TYPE.Connected);
+      await ds.query(
+        `INSERT INTO edit_actions (session_id, aggregate_id, target_system_id, target_table, operation, field_path, new_value, source, change_status, group_id, created_at, valid_until)
+         VALUES (?, ?, ?, 'UseCase', 'UPDATE', NULL, ?, 'MANUAL', 'UNSTAGED', NULL, datetime('now'), NULL)`,
+        [
+          sessionId,
+          1000,
+          1000,
+          JSON.stringify({
+            referencedComponents: {
+              sgSystemIds: [SG_ID_1],
+              dataLinkSystemIds: [600],
+              controlLinkSystemIds: [],
+            },
+          }),
+        ],
+      );
+
+      const [result] = await makeRepo(
+        qr.manager,
+        sessionId,
+      ).findWithActiveManualEdits(FILE_ID);
+      expect(result).toEqual(
+        expect.objectContaining({
+          changeId: expect.any(Number),
+          operation: CHANGE_OPERATION.Update,
+          usecase: expect.objectContaining({systemId: 1000}),
+          referencedComponents: {
+            sgSystemIds: [SG_ID_1],
+            dataLinkSystemIds: [600],
+            controlLinkSystemIds: [],
+          },
+        }),
+      );
+    });
+
+    it('retains a manual action when its effective usecase is missing', async () => {
+      await ds.query(
+        `INSERT INTO edit_actions (session_id, aggregate_id, target_system_id, target_table, operation, field_path, new_value, source, change_status, group_id, created_at, valid_until)
+         VALUES (?, ?, ?, 'UseCase', 'UPDATE', NULL, '{}', 'MANUAL', 'UNSTAGED', NULL, datetime('now'), NULL)`,
+        [sessionId, 9999, 9999],
+      );
+
+      await expect(
+        makeRepo(qr.manager, sessionId).findWithActiveManualEdits(FILE_ID),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          changeId: expect.any(Number),
+          operation: CHANGE_OPERATION.Update,
+          usecase: null,
+          referencedComponents: null,
+        }),
+      ]);
     });
 
     it('excludes superseded edits', async () => {
@@ -389,6 +515,54 @@ describe('TypeOrmUsecaseRepository (integration)', () => {
       );
       expect(rows).toHaveLength(6);
       expect(new Set(rows.map(r => r.target_system_id)).size).toBe(6);
+    });
+
+    it('stages GKV relationship actions in the usecase change group', async () => {
+      const repo = makeRepo(qr.manager, sessionId);
+      await qr.startTransaction();
+      await repo.create(
+        new UseCase({
+          systemId: 1000,
+          fileSystemId: FILE_ID,
+          alias: 'gkv-actions',
+          keyVector: {valueSystemIds: [7001, 7002]},
+          subgraphSystemIds: [SG_ID_1, SG_ID_2],
+          subgraphPairs: [
+            {
+              sourceSubgraphSystemId: SG_ID_1,
+              destSubgraphSystemId: SG_ID_2,
+            },
+          ],
+        }),
+        {source: SOURCE.AutoRouting},
+      );
+      await qr.commitTransaction();
+
+      const rows: Array<{
+        target_table: string;
+        target_system_id: number;
+        group_id: string;
+        new_value: string;
+      }> = await ds.query(
+        `SELECT target_table, target_system_id, group_id, new_value
+           FROM edit_actions WHERE session_id = ? AND aggregate_id = ?`,
+        [sessionId, 1000],
+      );
+      const gkvRows = rows.filter(
+        row => row.target_table === 'UsecaseGkvValues',
+      );
+      expect(rows).toHaveLength(6);
+      expect(gkvRows).toHaveLength(2);
+      expect(new Set(rows.map(row => row.group_id))).toEqual(
+        new Set(['test-group']),
+      );
+      expect(new Set(rows.map(row => row.target_system_id)).size).toBe(6);
+      expect(gkvRows.map(row => JSON.parse(row.new_value))).toEqual(
+        expect.arrayContaining([
+          {usecaseSystemId: 1000, valueDefSystemId: 7001},
+          {usecaseSystemId: 1000, valueDefSystemId: 7002},
+        ]),
+      );
     });
   });
 

@@ -269,10 +269,52 @@ export class ModuleNodeOverlayFetcher {
     const nodeMap = new Map(
       [...overlaidNode, ...createdNode].map(n => [n.systemId, n]),
     );
-    return [...overlaidSpf, ...createdSpf].map(sm => ({
-      ...sm,
-      parentId: nodeMap.get(sm.systemId)?.parentId ?? null,
-    }));
+    return [...overlaidSpf, ...createdSpf]
+      // A deleted Node removes its module from the effective topology even
+      // though the SpfModule row itself may remain committed.
+      .filter(module => !deletedNodeIds.has(module.systemId))
+      .map(sm => ({
+        ...sm,
+        parentId: nodeMap.get(sm.systemId)?.parentId ?? null,
+      }));
+  }
+
+  async fetchEffectiveForSubgraphs(
+    fileSystemId: number,
+    sessionId: number | null,
+    subgraphSystemIds: readonly number[],
+  ): Promise<SpfModuleBase[]> {
+    if (subgraphSystemIds.length === 0) return [];
+
+    const baseRows = (await this.manager
+      .getRepository(ENTITY_NAMES.SpfModule)
+      .createQueryBuilder('sm')
+      .select('sm.systemId')
+      .where('sm.fileSystemId = :fileSystemId', {fileSystemId})
+      .getMany()) as unknown as Array<{systemId: number}>;
+
+    const actions =
+      sessionId === null
+        ? []
+        : await this.editActionsSvc.getByTable(
+            sessionId,
+            ENTITY_NAMES.SpfModule,
+          );
+    const moduleIds = [
+      ...new Set([
+        ...baseRows.map(row => row.systemId),
+        ...actions.map(action => action.targetSystemId),
+      ]),
+    ];
+    const effectiveModules = await this.fetchOverLayedSpfModules(
+      moduleIds,
+      fileSystemId,
+      sessionId,
+    );
+    const subgraphIdSet = new Set(subgraphSystemIds);
+    return effectiveModules.filter(module =>
+      subgraphIdSet.has(module.subgraphSystemId),
+    );
   }
 
   /**

@@ -65,7 +65,12 @@ export class UsecaseGkvValuesFetcher {
       }>;
       const ucId = p.usecaseSystemId;
       const vdId = p.valueDefSystemId;
-      if (!ucId || !vdId || !entriesByUsecase.has(ucId)) continue;
+      if (
+        ucId === undefined ||
+        vdId === undefined ||
+        !entriesByUsecase.has(ucId)
+      )
+        continue;
       const entries = entriesByUsecase.get(ucId)!;
       if (action.operation === CHANGE_OPERATION.Create) {
         if (!entries.has(vdId))

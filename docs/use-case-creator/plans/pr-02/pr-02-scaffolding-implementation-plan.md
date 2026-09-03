@@ -10,7 +10,7 @@
 
 **Specification:** `docs/use-case-creator/plans/pr-02/pr-02-scaffolding-design.md`
 
-**Blocking prerequisite:** Handler registration and runtime DI cannot be completed until the subsystem-links work lands an exported `IChainResolver` satisfying `resolveAllChains(uow: UnitOfWork): Promise<Result<void>>`. Tasks 1-10 and 14-16 can proceed first. Before Tasks 11-13, rebase the owning dependency and verify that exact contract. Do not add a duplicate resolver, compatibility adapter, or no-op fallback.
+**Temporary resolver boundary:** PR-02 uses the approved `SubsystemLinkResolutionService` stub from `docs/use-case-creator/design/chain-resolver-stub-design.md`. It always returns a failed `Result` without side effects, so handlers roll back before AUTO cleanup, input assembly, discovery, engine execution, cache flush, or commit. The real subsystem-links work replaces this service's internals only; do not add resolver DI, a separate port, or a no-op success fallback.
 
 ---
 
@@ -843,75 +843,51 @@ Expected: PASS with no persistence calls.
 
 ---
 
-### Task 11: Verify and Wire the External Chain Resolver Prerequisite
+### Task 11: Add the Temporary Chain Resolver Stub
 
-**Package:** `@arc/core`, `@arc/api`
+**Package:** `@arc/core`
 
 **Files:**
-- Modify: `packages/core/src/application/orchestration/cqrs/registries/command-handler-registry.ts`
-- Modify: `packages/core/src/application/orchestration/command-bus.ts`
-- Modify: `packages/api/src/infrastructure-wrapper/arc-cqrs.module.ts`
-- Test: `packages/core/tests/unit/application/orchestration/command-bus-session.spec.ts`
+ - Create: `packages/core/src/application/usecase-designer/auto-usecase-creator/services/subsystem-link-resolution.service.ts`
+ - Test: `packages/core/tests/unit/application/usecase-designer/auto-usecase-creator/services/subsystem-link-resolution.service.spec.ts`
 
-- [ ] **Step 1: Verify the rebased dependency before editing**
 
-Run:
+- [ ] **Step 1: Add a failing side-effect-free failure test**
 
-```bash
-rg "interface IChainResolver|resolveAllChains" packages
-```
+Construct the service with a mocked UoW and assert `resolveAllChains` returns a failed `Result` without calling any UoW method. The failure must be generic and must not imply that any chain was resolved.
 
-Expected: one exported core-facing interface with:
-
-```typescript
-export interface IChainResolver {
-  resolveAllChains(uow: UnitOfWork): Promise<Result<void>>;
-}
-```
-
-If the command finds no compatible implementation, stop this task and keep Tasks 12-13 blocked. Do not create a substitute.
-
-- [ ] **Step 2: Add failing CommandBus dependency propagation and command-policy tests**
-
-Construct the bus with a resolver mock and assert the handler factory receives the same instance through `CommandHandlerDependencies`. Exercise both routing commands through the existing session-policy path and assert `DESIGNER`/`DIFF_MERGE` sessions are admitted while a disallowed session mode is rejected before handler creation.
-
-```typescript
-expect(factory.create).toHaveBeenCalledWith(
-  expect.objectContaining({chainResolver}),
-);
-```
-
-- [ ] **Step 3: Pass the landed resolver through existing manual DI**
-
-Extend the dependency bag and bus constructor with the exact landed interface:
-
-```typescript
-export interface CommandHandlerDependencies {
-  readonly uow: UnitOfWork;
-  readonly chainResolver: IChainResolver;
-  readonly idGeneration: IdGenerationPort;
-  readonly naturalIdGeneration: NaturalIdGenerationPort;
-  readonly fileSystem: FileSystemPort;
-  readonly queryServices: QueryServices;
-  readonly workerPool?: WorkerPoolPort;
-  readonly logger?: Logger;
-  readonly profiler?: ProfilerPort;
-}
-```
-
-Register/inject the concrete resolver in `ArcCqrsModule` using the runtime token supplied by its owning subsystem-links implementation. Pass that same singleton into `CommandBus`; the resolver must receive the per-command UoW from the handler rather than creating one.
-
-- [ ] **Step 4: Run focused CQRS tests and package builds**
+- [ ] **Step 2: Run the focused service test**
 
 Run:
 
 ```bash
-pnpm --filter @arc/core run test:unit -- --runInBand --runTestsByPath tests/unit/application/orchestration/command-bus-session.spec.ts
+pnpm --filter @arc/core run test:unit -- --runInBand --runTestsByPath tests/unit/application/usecase-designer/auto-usecase-creator/services/subsystem-link-resolution.service.spec.ts
+```
+
+Expected: FAIL with a module-not-found error.
+
+- [ ] **Step 3: Implement the approved failing stub**
+
+```typescript
+export class SubsystemLinkResolutionService {
+  async resolveAllChains(_uow: UnitOfWork): Promise<Result<void>> {
+    return Result.fail([/* generic temporary resolver issue */]);
+  }
+}
+```
+
+Keep the class stateless and framework-free. Do not modify `CommandBus`, `CommandHandlerDependencies`, `ArcCqrsModule`, or registry factory signatures. The real subsystem-links implementation replaces this method body in place.
+
+- [ ] **Step 4: Run focused tests and build core**
+
+Run:
+
+```bash
+pnpm --filter @arc/core run test:unit -- --runInBand --runTestsByPath tests/unit/application/usecase-designer/auto-usecase-creator/services/subsystem-link-resolution.service.spec.ts
 pnpm run build:core
-pnpm run build:api
 ```
 
-Expected: PASS with one resolver instance propagated through the registry dependency bag.
+Expected: PASS with an explicit, side-effect-free failing resolver stub.
 
 ---
 
@@ -928,27 +904,10 @@ Expected: PASS with one resolver instance propagated through the registry depend
 - Test: `packages/core/tests/unit/application/usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.handler.spec.ts`
 - Test: `packages/core/tests/unit/application/usecase-designer/auto-usecase-creator/create-usecases/create-usecases.command.spec.ts`
 - Test: `packages/core/tests/unit/application/usecase-designer/auto-usecase-creator/create-manual-usecases/create-manual-usecases.command.spec.ts`
-- Test: `packages/infrastructure/persistence/tests/integration/usecase-designer/auto-usecase-creator/create-usecases.handler.integration.spec.ts`
 
-- [ ] **Step 1: Write handler ordering, failure, cleanup, and transaction tests**
+- [ ] **Step 1: Write handler failure-prevention and transaction tests**
 
-For automatic routing assert:
-
-```typescript
-expect(calls).toEqual([
-  'startTransaction',
-  'resolveAllChains',
-  'deleteEditActionsBySource:AUTO_ROUTING',
-  'readGraphEdits',
-  'readSelectedUsecases',
-  'readCommittedUsecasesForStaleUcs',
-  'engineRun',
-  'applyCachedActions',
-  'commit',
-]);
-```
-
-Assert `readCommittedUsecasesForStaleUcs` calls `UsecaseRepository.findAll(fileSystemId, {readMode: READ_MODE.Committed})`, filters `type === USECASE_TYPE.Disconnected`, and supplies a copied `staleUcs` array independently of `selectedUsecaseSystemIds`. The PR-02 Phase 2 stub must not populate `context.allUcs`; its later implementation owns the committed `allUcs` load. Selected UC reads may use the effective overlay. Test both routing command constructors for deep array copies and their `requiresSession`/allowed-mode static contract. For manual routing assert resolver-before-discovery, SG exclusion filtering with order preservation, explicit link exclusions passed to the injected discovery service, no AUTO cleanup, engine execution, cache flush, and commit. For both handlers assert resolver/engine `FAIL` becomes `DomainRuleViolationException`, rollback precedes rethrow, and later steps are not called. Separately, make the resolver reject/throw and assert rollback occurs before rethrow while cleanup, input reads/discovery, engine execution, and commit are never called.
+The temporary resolver always fails, so assert both handlers start a transaction, invoke it, roll back on its failed `Result`, and do not invoke cleanup, input reads, manual discovery, engine execution, cache flush, or commit. Test both routing command constructors for deep array copies and their `requiresSession`/allowed-mode static contract. Keep successful resolver-path handler tests, cleanup-order tests, and resolver-write visibility integration tests deferred until the real resolver replaces the stub.
 
 - [ ] **Step 2: Run the handler tests and verify commands/handlers are absent**
 
@@ -978,16 +937,18 @@ Implement each handler with this complete control-flow skeleton:
 export class CreateUsecasesHandler
   implements CommandHandler<CreateUsecasesCommand, Result<RoutingOutcome>>
 {
+  private readonly subsystemLinkResolutionService =
+    new SubsystemLinkResolutionService();
+
   constructor(
     private readonly uow: UnitOfWork,
-    private readonly chainResolver: IChainResolver,
     private readonly engine: RoutingEngine,
   ) {}
 
   async handle(command: CreateUsecasesCommand): Promise<Result<RoutingOutcome>> {
     await this.uow.startTransaction();
     try {
-      // 1. Resolve all data/control subsystem-link chains with this.uow.
+      // 1. Invoke the temporary subsystem-link resolver with this.uow.
       // 2. Convert resolver FAIL to DomainRuleViolationException.
       // 3. Delete all current-session SOURCE.AutoRouting actions.
       // 4. Read SG/data/control session changes after cleanup.
@@ -1005,20 +966,17 @@ export class CreateUsecasesHandler
 }
 ```
 
-The manual handler constructor explicitly receives `ManualPairDiscoveryService` in addition to UoW, resolver, and engine. It uses the same transaction/error sequence but does not clean AUTO actions. It filters excluded SGs before discovery, preserving relative order; passes explicit link exclusions to that injected service; reads graph edits after resolution; and constructs `ManualRoutingInput` with the discovered topology. Neither handler commits a failed result.
-
-Add two real-TypeORM-UoW integration cases with the landed resolver. First, use a fixture whose unresolved subsystem link produces a staged derived-link change. Spy only on `RoutingEngine.run`, execute the handler, and assert the engine input's `graphEdits` contains that change before commit. This proves resolver writes and repository input reads share the same QueryRunner/transaction rather than merely proving mock call order. Second, seed active and superseded current-session AUTO_ROUTING rows, configure the engine to fail, execute the handler, and directly assert rollback restores every pre-existing AUTO row after its cleanup ran.
+The manual handler constructor explicitly receives `ManualPairDiscoveryService` in addition to UoW and engine. It creates the same temporary resolver internally. Neither handler commits a failed result. Successful resolver-path integration coverage, including staged derived-link visibility and AUTO-cleanup rollback restoration after a later engine failure, is deferred until the real resolver replaces the stub.
 
 - [ ] **Step 4: Run handler tests and core typecheck**
 
 Run the Task 12 Step 2 command, then:
 
 ```bash
-pnpm --filter @arc/persistence run test:integration -- --runInBand --runTestsByPath tests/integration/usecase-designer/auto-usecase-creator/create-usecases.handler.integration.spec.ts
 pnpm --filter @arc/core run typecheck
 ```
 
-Expected: PASS for success, resolver failure/rejection, engine failure, thrown errors, cleanup distinction, committed stale-UC assembly, command policy/copying, resolver-write visibility, and rollback restoration after AUTO cleanup.
+Expected: PASS for temporary-resolver failure, rollback, command policy/copying, and prevention of every later handler action.
 
 ---
 
@@ -1043,7 +1001,7 @@ expect(
 ).toBeDefined();
 ```
 
-Create each factory with dependencies and assert it returns the correct handler class with the supplied UoW/resolver. The manual handler unit test from Task 12 injects a mocked `ManualPairDiscoveryService` directly and proves the handler uses that exact constructor dependency.
+Create each factory with dependencies and assert it returns the correct handler class with the supplied UoW. The manual handler unit test from Task 12 injects a mocked `ManualPairDiscoveryService` directly and proves the handler uses that exact constructor dependency.
 
 - [ ] **Step 2: Run the registry test**
 
@@ -1057,7 +1015,7 @@ Expected: FAIL because neither command is registered.
 
 - [ ] **Step 3: Add manual registrations and public exports**
 
-Register factories that construct one `RoutingEngine` through `createRoutingEngine()`, inject `deps.uow` plus `deps.chainResolver` into both handlers, and inject a constructed `ManualPairDiscoveryService` into the manual handler. Export commands, routing contracts, engine, and manual discovery through the feature barrel, then add:
+Register factories that construct one `RoutingEngine` through `createRoutingEngine()`, inject `deps.uow` into both handlers, and inject a constructed `ManualPairDiscoveryService` into the manual handler. Each handler owns its temporary `SubsystemLinkResolutionService` instance. Export commands, routing contracts, engine, manual discovery, and the resolver stub through the feature barrel, then add:
 
 ```typescript
 export * from './application/usecase-designer/auto-usecase-creator/index.js';
@@ -1439,7 +1397,7 @@ Run:
 
 ```bash
 pnpm --filter @arc/core run test:unit -- --runInBand --testPathPattern=tests/unit/application/usecase-designer/auto-usecase-creator
-pnpm --filter @arc/persistence run test:integration -- --runInBand --runTestsByPath tests/integration/repositories/usecase/use-case.repository.integration.spec.ts tests/integration/repositories/subgraph/subgraph.repository.integration.spec.ts tests/integration/repositories/session/typeorm-session.repository.spec.ts tests/integration/usecase-designer/auto-usecase-creator/create-usecases.handler.integration.spec.ts
+pnpm --filter @arc/persistence run test:integration -- --runInBand --runTestsByPath tests/integration/repositories/usecase/use-case.repository.integration.spec.ts tests/integration/repositories/subgraph/subgraph.repository.integration.spec.ts tests/integration/repositories/session/typeorm-session.repository.spec.ts
 ```
 
 Expected: PASS.
@@ -1469,10 +1427,10 @@ Expected: PASS with no ESM imports missing `.js`, no framework/Node imports in c
 
 - [ ] **Step 5: Update progress with verified facts**
 
-Mark PR-02 complete only if the external resolver is landed, both handlers are wired, every check above passes, and all three HTTP methods remain intentional 501 stubs. Otherwise record the exact unresolved resolver dependency and completed task range without claiming PR completion.
+Mark PR-02 complete only if the temporary resolver stub is wired, both handlers are registered, every check above passes, and all three HTTP methods remain intentional 501 stubs. Record that successful resolver-path coverage remains deferred until the real subsystem-links implementation replaces the stub.
 
 ```markdown
-- **PR 2:** implementation complete; auto/manual activation remains assigned to PR 6/7 and structural activation to PR 11.
+- **PR 2:** implementation complete with the temporary failing chain-resolver stub; auto/manual activation remains assigned to PR 6/7 and structural activation to PR 11.
 ```
 
 Use the completion line only when every prerequisite and verification condition is satisfied. Do not stage this file as part of this task; leave staging decisions to the user.

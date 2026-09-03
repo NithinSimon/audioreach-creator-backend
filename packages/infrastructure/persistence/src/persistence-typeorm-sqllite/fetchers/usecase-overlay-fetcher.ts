@@ -8,7 +8,8 @@ import type {UsecaseType} from '@arc/core';
 import {ENTITY_NAMES} from '../entity-schema/entity-table-names.js';
 import {OverlayMergeImpl} from '../queries/edit-session/overlay-merge.js';
 import type {EditActionsQueryService} from '../queries/edit-session/edit-actions-query-service.js';
-import {UseCaseSchema} from '../entity-schema/usecase-data/use-case.js';
+import type {EditActionRow} from '../entity-schema/edit-session/edit-action.schema.js';
+import {CHANGE_OPERATION, SOURCE} from '@arc/core';
 import type {
   UseCaseBase,
   UsecaseGkvValuesBase,
@@ -82,7 +83,7 @@ export class UsecaseOverlayFetcher {
       .getRepository(ENTITY_NAMES.UseCase)
       .createQueryBuilder('uc')
       .where('uc.fileSystemId = :fileSystemId', {fileSystemId});
-    if (filters) applyEntityFilters(qb, 'uc', filters);
+    if (sessionId === null && filters) applyEntityFilters(qb, 'uc', filters);
     const baseRows = (await qb.getMany()) as UseCaseBase[];
 
     if (sessionId === null) return baseRows;
@@ -92,13 +93,21 @@ export class UsecaseOverlayFetcher {
       ENTITY_NAMES.UseCase,
     );
 
-    return this.overlay
+    const effectiveRows = this.overlay
       .applyToCollection(
         baseRows,
         actions,
-        filters ? nv => matchesEntityFilters(nv, filters) : undefined,
       )
       .map(r => r.effective);
+
+    return filters
+      ? effectiveRows.filter(row =>
+          matchesEntityFilters(
+            row as unknown as Record<string, unknown>,
+            filters,
+          ),
+        )
+      : effectiveRows;
   }
 
   // ── Assembled entry points (scalars + GKV + categories + junctions) ──────────
@@ -187,6 +196,22 @@ export class UsecaseOverlayFetcher {
         pairMap.get(uc.systemId) ?? [],
       ),
     );
+  }
+
+  /**
+   * Returns the active MANUAL UseCase actions for the current session. The
+   * repository maps these persistence rows to its domain-facing result while
+   * this fetcher owns the edit-action query boundary.
+   */
+  async getActiveManualUsecaseActions(
+    sessionId: number,
+  ): Promise<EditActionRow[]> {
+    return this.editActionsSvc.query({
+      sessionId,
+      targetTable: ENTITY_NAMES.UseCase,
+      source: SOURCE.Manual,
+      operations: [CHANGE_OPERATION.Create, CHANGE_OPERATION.Update],
+    });
   }
 
   /**
@@ -342,41 +367,4 @@ export class UsecaseOverlayFetcher {
     };
   }
 
-  /**
-   * Returns fully-assembled OverlaidUsecases that have at least one active
-   * MANUAL edit_action in the current session.
-   */
-  async fetchWithActiveManualEdits(
-    fileSystemId: number,
-    sessionId: number,
-  ): Promise<OverlaidUseCase[]> {
-    const idRows = await this.manager
-      .createQueryBuilder()
-      .select('uc.system_id', 'systemId')
-      .distinct(true)
-      .from(UseCaseSchema, 'uc')
-      .innerJoin(
-        'edit_actions',
-        'ea',
-        `ea.target_system_id = uc.system_id
-         AND ea.target_table = :targetTable
-         AND ea.source = :source
-         AND ea.valid_until IS NULL`,
-        {targetTable: ENTITY_NAMES.UseCase, source: 'MANUAL'},
-      )
-      .innerJoin(
-        'project_sessions',
-        'ps',
-        'ps.session_id = ea.session_id AND ps.file_system_id = uc.file_system_id',
-      )
-      .where('uc.file_system_id = :fileSystemId', {fileSystemId})
-      .getRawMany<{systemId: number}>();
-
-    if (idRows.length === 0) return [];
-    return this.getUsecases(
-      fileSystemId,
-      sessionId,
-      idRows.map(r => r.systemId),
-    );
-  }
 }

@@ -6,6 +6,7 @@
 import type {EntityManager} from 'typeorm';
 import type {
   UsecaseRepository,
+  ActiveManualUsecaseEdit,
   ReadOptions,
   ReferencedComponents,
   StructuralDelta,
@@ -14,11 +15,16 @@ import type {
   UsecaseType,
   IdGenerationPort,
 } from '@arc/core';
-import {UseCase, READ_MODE} from '@arc/core';
+import {
+  CHANGE_OPERATION,
+  UseCase,
+  READ_MODE,
+} from '@arc/core';
 import type {PendingChangeWriter} from '../../services/pending-change-writer.js';
 import {ENTITY_NAMES} from '../../entity-schema/entity-table-names.js';
 import {UsecaseOverlayFetcher} from '../../fetchers/usecase-overlay-fetcher.js';
 import type {OverlaidUseCase} from '../../fetchers/usecase-overlay-fetcher.js';
+import {UsecaseGkvValuesFetcher} from '../../fetchers/usecase-gkv-values-fetcher.js';
 import {EditActionsQueryService} from '../../queries/edit-session/edit-actions-query-service.js';
 import type {UseCaseSubgraphBase} from '../../entity-schema/usecase-data/use-case-subgraph.schema.js';
 import type {UseCaseSubgraphPairBase} from '../../entity-schema/usecase-data/use-case-subgraph-pair.schema.js';
@@ -32,9 +38,12 @@ export class TypeOrmUsecaseRepository implements UsecaseRepository {
     private readonly uow: UnitOfWork,
     private readonly idGeneration: IdGenerationPort,
   ) {
+    const editActionsQueryService = new EditActionsQueryService(manager);
     this.ucFetcher = new UsecaseOverlayFetcher(
       manager,
-      new EditActionsQueryService(manager),
+      editActionsQueryService,
+      undefined,
+      new UsecaseGkvValuesFetcher(manager, editActionsQueryService),
     );
   }
 
@@ -70,13 +79,35 @@ export class TypeOrmUsecaseRepository implements UsecaseRepository {
     return overlaid.map(uc => this.hydrateOverlaid(uc));
   }
 
-  async findWithActiveManualEdits(fileSystemId: number): Promise<UseCase[]> {
+  async findWithActiveManualEdits(
+    fileSystemId: number,
+  ): Promise<ActiveManualUsecaseEdit[]> {
     const sessionId = this.uow.getWriteContext().session.sessionId;
-    const overlaid = await this.ucFetcher.fetchWithActiveManualEdits(
-      fileSystemId,
+    const actions = await this.ucFetcher.getActiveManualUsecaseActions(
       sessionId,
     );
-    return overlaid.map(uc => this.hydrateOverlaid(uc));
+    if (actions.length === 0) return [];
+
+    const usecases = await this.ucFetcher.getUsecases(
+      fileSystemId,
+      sessionId,
+      [...new Set(actions.map(action => action.targetSystemId))],
+    );
+    const usecaseById = new Map(
+      usecases.map(usecase => [usecase.systemId, this.hydrateOverlaid(usecase)]),
+    );
+
+    return actions.map(action => ({
+      changeId: action.changeId,
+      usecase: usecaseById.get(action.targetSystemId) ?? null,
+      operation:
+        action.operation === CHANGE_OPERATION.Create
+          ? CHANGE_OPERATION.Create
+          : CHANGE_OPERATION.Update,
+      referencedComponents: this.parseReferencedComponents(
+        action.newValue as Record<string, unknown>,
+      ),
+    }));
   }
 
   // ── Writes ───────────────────────────────────────────────────────────────────
@@ -106,6 +137,24 @@ export class TypeOrmUsecaseRepository implements UsecaseRepository {
       groupId,
       this.manager,
     );
+
+    for (const valueDefSystemId of uc.keyVector.valueSystemIds) {
+      const relationshipSystemId = await this.idGeneration.getNextId(
+        uc.fileSystemId,
+      );
+      await this.writer.writeCreate(
+        {
+          targetTable: ENTITY_NAMES.UsecaseGkvValues,
+          targetSystemId: relationshipSystemId,
+          aggregateId: uc.systemId,
+          payload: {usecaseSystemId: uc.systemId, valueDefSystemId},
+          ...options,
+        },
+        session.sessionId,
+        groupId,
+        this.manager,
+      );
+    }
 
     for (const sgSystemId of uc.subgraphSystemIds) {
       const relationshipSystemId = await this.idGeneration.getNextId(
@@ -416,5 +465,39 @@ export class TypeOrmUsecaseRepository implements UsecaseRepository {
         valueSystemIds: uc.gkvEntries.map(g => g.valueDefSystemId),
       },
     });
+  }
+
+  private parseReferencedComponents(
+    value: Record<string, unknown>,
+  ): ActiveManualUsecaseEdit['referencedComponents'] {
+    const referencedComponents = value.referencedComponents;
+    if (
+      referencedComponents === null ||
+      typeof referencedComponents !== 'object' ||
+      Array.isArray(referencedComponents)
+    ) {
+      return null;
+    }
+
+    const payload = referencedComponents as Record<string, unknown>;
+    const isNumberArray = (candidate: unknown): candidate is number[] =>
+      Array.isArray(candidate) &&
+      candidate.every(
+        item => typeof item === 'number' && Number.isSafeInteger(item),
+      );
+
+    if (
+      !isNumberArray(payload.sgSystemIds) ||
+      !isNumberArray(payload.dataLinkSystemIds) ||
+      !isNumberArray(payload.controlLinkSystemIds)
+    ) {
+      return null;
+    }
+
+    return {
+      sgSystemIds: [...payload.sgSystemIds],
+      dataLinkSystemIds: [...payload.dataLinkSystemIds],
+      controlLinkSystemIds: [...payload.controlLinkSystemIds],
+    };
   }
 }

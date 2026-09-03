@@ -45,6 +45,7 @@ export type WriteDeleteSpec = {
   targetTable: EntityName;
   targetSystemId: number;
   aggregateId: number;
+  payload?: Record<string, unknown>;
   linkedEntityGroupId?: string;
   cache?: boolean;
   source?: Source;
@@ -244,7 +245,7 @@ export class PendingChangeWriter {
       targetTable: spec.targetTable,
       operation: CHANGE_OPERATION.Delete,
       fieldPath: null as string | null,
-      newValue: {} as Record<string, unknown>,
+      newValue: spec.payload ?? {},
       source,
       changeStatus,
       groupId,

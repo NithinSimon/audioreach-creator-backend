@@ -4,6 +4,7 @@
  */
 
 import type {EditOptions} from '../../edit-options.js';
+import {CHANGE_OPERATION} from '../../../../shared/change-vocabulary.js';
 import type {UseCase} from '../../../../../domain/entities/usecase-data/usecase/usecase.js';
 import type {UsecaseType} from '../../../../../domain/entities/usecase-data/usecase/usecase-type.js';
 import type {SubgraphPair} from '../shared/links-for-pair.js';
@@ -25,6 +26,15 @@ export interface ReferencedComponents {
   sgSystemIds: number[];
   dataLinkSystemIds: number[];
   controlLinkSystemIds: number[];
+}
+
+export interface ActiveManualUsecaseEdit {
+  readonly changeId: number;
+  readonly usecase: UseCase | null;
+  readonly operation:
+    | typeof CHANGE_OPERATION.Create
+    | typeof CHANGE_OPERATION.Update;
+  readonly referencedComponents: ReferencedComponents | null;
 }
 
 /**
@@ -114,7 +124,9 @@ export interface UsecaseRepository {
    * Not affected by `readMode` — this query is inherently about
    * `edit_actions` state, not overlay-vs-committed base rows.
    */
-  findWithActiveManualEdits(fileSystemId: number): Promise<UseCase[]>;
+  findWithActiveManualEdits(
+    fileSystemId: number,
+  ): Promise<ActiveManualUsecaseEdit[]>;
 
   /**
    * Creates a UseCase. Emits a CREATE `edit_actions` row for the base
